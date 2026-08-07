@@ -262,6 +262,19 @@ not have. That is a real experiment with a real prediction, not a demo.
 
 ---
 
+## 6b. Outstanding: oriented-box walls
+
+The environment now contains **trap structures** — U-shaped pockets, gapped
+barriers, dead-end corridors — built from oriented boxes, because scattered convex
+obstacles left the task solvable without a reference path at all (see
+`docs/reading-guide.md`). The 2-D scan casts against them; the depth module does
+**not** yet.
+
+Ray–oriented-box is the slab method in the box's local frame, and the 2-D version
+already exists in `torch_env._cast_rays_at_walls` — the 3-D extension adds a third
+slab for height. Do this before any depth-vs-scan comparison, or the comparison
+measures the missing primitive rather than the thing under test.
+
 ## 7. Implementation order
 
 Build it so that every stage is verifiable before the next one depends on it.

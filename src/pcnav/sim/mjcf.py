@@ -33,6 +33,7 @@ CHASSIS_RIDE_HEIGHT = WHEEL_RADIUS
 OBSTACLE_HEIGHT = 1.2
 WALL_HEIGHT = 1.0
 WALL_THICKNESS = 0.2
+STRUCTURE_HEIGHT = 1.2   # trap walls: U-pockets, gapped barriers, dead ends
 
 
 def _wheel_body(name: str, x: float, y: float) -> str:
@@ -84,6 +85,18 @@ def build_scene_xml(
         )
     )
 
+    # Trap structures are oriented boxes; MuJoCo takes orientation as a quaternion
+    # about z, so yaw is converted here rather than stored twice.
+    structures = "\n".join(
+        f'      <geom name="structure_{i}" type="box" '
+        f'pos="{cx:.3f} {cy:.3f} {STRUCTURE_HEIGHT / 2:.3f}" '
+        f'size="{half_len:.3f} {half_thick:.3f} {STRUCTURE_HEIGHT / 2:.3f}" '
+        f'quat="{np.cos(yaw / 2):.6f} 0 0 {np.sin(yaw / 2):.6f}" '
+        f'rgba="0.38 0.40 0.46 1"/>'
+        for i, (cx, cy, half_len, half_thick, yaw) in enumerate(map_data.walls)
+        if half_len > 0
+    )
+
     markers = ""
     if include_visual_markers:
         # Path markers are repositioned from Python each frame; 60 covers the
@@ -127,6 +140,7 @@ def build_scene_xml(
           material="grid_mat"/>
 
 {walls}
+{structures}
 {obstacles}
 {markers}
 

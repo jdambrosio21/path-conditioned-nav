@@ -75,6 +75,8 @@ class PathConditionedNavEnv:
             n_goals=config.maps.goals_per_map,
             n_starts=config.maps.starts_per_goal,
             min_goal_dist=config.maps.min_start_goal_geodesic_m,
+            n_structures=config.maps.num_structures,
+            min_detour_ratio=config.maps.min_detour_ratio,
         )
         self._pack_maps_to_device()
         self._load_path_library()
@@ -95,6 +97,16 @@ class PathConditionedNavEnv:
         for i, map_data in enumerate(self.maps):
             packed[i, : len(map_data.obstacles)] = map_data.obstacles
         self.obstacles = torch.from_numpy(packed).to(self.device)
+
+        # Walls are oriented boxes: (cx, cy, half_length, half_thickness, yaw).
+        # Padding rows carry half_length = -1 and are rejected by every test.
+        max_walls = max(1, max(len(m.walls) for m in self.maps))
+        packed_walls = np.zeros((num_maps, max_walls, 5), dtype=np.float32)
+        packed_walls[..., 2] = -1.0
+        for i, map_data in enumerate(self.maps):
+            if len(map_data.walls):
+                packed_walls[i, : len(map_data.walls)] = map_data.walls
+        self.walls = torch.from_numpy(packed_walls).to(self.device)
 
         geodesic = np.stack([m.dist for m in self.maps])          # (M, K, H, W)
         self.goals_per_map, self.grid_h, self.grid_w = geodesic.shape[1:]
@@ -386,7 +398,50 @@ class PathConditionedNavEnv:
                           (ROBOT_RADIUS_M - pos_y) / (dir_y - eps))
         wall_range = torch.minimum(t_x.abs(), t_y.abs())
 
-        return torch.minimum(obstacle_range, wall_range).clamp(0.0, SENSOR_MAX_RANGE_M)
+        structure_range = self._cast_rays_at_walls(dir_x, dir_y)
+        nearest = torch.minimum(torch.minimum(obstacle_range, wall_range), structure_range)
+        return nearest.clamp(0.0, SENSOR_MAX_RANGE_M)
+
+    def _cast_rays_at_walls(self, dir_x: torch.Tensor, dir_y: torch.Tensor) -> torch.Tensor:
+        """Ray casting against oriented-box walls, via the slab method.
+
+        The ray is transformed into each box's local frame (where the box is
+        axis-aligned) and intersected with two slabs. Working in the local frame is
+        what keeps rotated geometry as cheap as axis-aligned geometry.
+        """
+        walls = self.walls[self.map_index]                               # (E, W, 5)
+        centre_x, centre_y, half_len, half_thick, yaw = walls.unbind(-1)
+        is_real = half_len > 0
+        # Inflate to configuration space, matching the circular obstacles.
+        half_len = half_len + ROBOT_RADIUS_M
+        half_thick = half_thick + ROBOT_RADIUS_M
+
+        cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)                    # (E, W)
+        offset_x = self.position[:, 0:1] - centre_x
+        offset_y = self.position[:, 1:2] - centre_y
+        local_ox = (offset_x * cos_y + offset_y * sin_y)[:, None, :]     # (E, 1, W)
+        local_oy = (-offset_x * sin_y + offset_y * cos_y)[:, None, :]
+
+        local_dx = dir_x[..., None] * cos_y[:, None, :] + dir_y[..., None] * sin_y[:, None, :]
+        local_dy = -dir_x[..., None] * sin_y[:, None, :] + dir_y[..., None] * cos_y[:, None, :]
+
+        eps = 1e-9
+        inv_dx = 1.0 / torch.where(local_dx.abs() < eps, torch.full_like(local_dx, eps), local_dx)
+        inv_dy = 1.0 / torch.where(local_dy.abs() < eps, torch.full_like(local_dy, eps), local_dy)
+
+        tx1 = (-half_len[:, None, :] - local_ox) * inv_dx
+        tx2 = (half_len[:, None, :] - local_ox) * inv_dx
+        ty1 = (-half_thick[:, None, :] - local_oy) * inv_dy
+        ty2 = (half_thick[:, None, :] - local_oy) * inv_dy
+
+        t_near = torch.maximum(torch.minimum(tx1, tx2), torch.minimum(ty1, ty2))
+        t_far = torch.minimum(torch.maximum(tx1, tx2), torch.maximum(ty1, ty2))
+
+        # Use the exit point when the origin is already inside the slab overlap.
+        t = torch.where(t_near > 0, t_near, t_far)
+        hit = is_real[:, None, :] & (t_far >= t_near) & (t > 0)
+        return torch.where(hit, t, torch.full_like(t, SENSOR_MAX_RANGE_M)).min(dim=2).values
+
 
     def _clearance(self) -> torch.Tensor:
         """Signed distance from the robot's edge to the nearest obstacle surface.
@@ -402,11 +457,28 @@ class PathConditionedNavEnv:
             radius > 0, surface_dist, torch.full_like(surface_dist, 1e3)
         ).min(dim=1).values
 
-        wall_dist = torch.minimum(
+        boundary_dist = torch.minimum(
             self.position.min(dim=1).values,
             (self.arena_size - self.position).min(dim=1).values,
         )
-        return torch.minimum(surface_dist, wall_dist) - ROBOT_RADIUS_M
+        return torch.minimum(
+            torch.minimum(surface_dist, boundary_dist), self._wall_clearance()
+        ) - ROBOT_RADIUS_M
+
+    def _wall_clearance(self) -> torch.Tensor:
+        """Distance from the robot centre to the nearest oriented-box wall."""
+        walls = self.walls[self.map_index]
+        centre_x, centre_y, half_len, half_thick, yaw = walls.unbind(-1)
+        offset_x = self.position[:, 0:1] - centre_x
+        offset_y = self.position[:, 1:2] - centre_y
+        cos_y, sin_y = torch.cos(-yaw), torch.sin(-yaw)
+
+        local_x = (offset_x * cos_y - offset_y * sin_y).abs() - half_len
+        local_y = (offset_x * sin_y + offset_y * cos_y).abs() - half_thick
+        outside = torch.hypot(local_x.clamp(min=0.0), local_y.clamp(min=0.0))
+        inside = torch.maximum(local_x, local_y).clamp(max=0.0)
+        distance = outside + inside
+        return torch.where(half_len > 0, distance, torch.full_like(distance, 1e3)).min(dim=1).values
 
     def _waypoints_in_body_frame(
         self, path: torch.Tensor, path_len: torch.Tensor, vertex: torch.Tensor

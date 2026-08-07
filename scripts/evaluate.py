@@ -67,7 +67,10 @@ def load_policy(checkpoint_path: Path, num_envs: int, device: str):
     # mismatch in the *actor* means the loaded policy is not the one that trained.
     if missing or unexpected:
         actor_affected = [k for k in list(missing) + list(unexpected) if k.startswith("actor")]
-        print(f"  checkpoint/architecture mismatch: {len(missing)} missing, {len(unexpected)} unexpected")
+        print(
+            f"  checkpoint/architecture mismatch: "
+            f"{len(missing)} missing, {len(unexpected)} unexpected"
+        )
         if actor_affected:
             print(f"  WARNING: actor weights affected: {actor_affected}")
         else:

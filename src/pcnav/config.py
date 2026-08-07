@@ -94,6 +94,14 @@ class MapConfig:
     goals_per_map: int = 8
     starts_per_goal: int = 12
     min_start_goal_geodesic_m: float = 12.0   # keeps every episode long-range
+    # Trap structures (U-pockets, gapped barriers, dead-end corridors) per arena.
+    # Scattered convex obstacles alone leave the task solvable by driving at the
+    # goal, which makes reference paths worthless and the paper's effect
+    # unmeasurable.
+    num_structures: tuple[int, int] = (2, 5)
+    # Minimum geodesic/straight-line ratio for a usable (start, goal) pair: the
+    # route must actually require going around something.
+    min_detour_ratio: float = 1.25
     roadmap_nodes: int = 400
     roadmap_neighbors: int = 10
 
