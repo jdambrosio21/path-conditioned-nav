@@ -1,5 +1,4 @@
 """Mixed-condition diagnostic: does the critic fix restore per-condition learning?"""
-import torch
 from pcnav.algorithms import Runner
 from pcnav.config import EnvConfig, ExperimentConfig, MapConfig, PPOConfig, TrainConfig
 from pcnav.utils import seed_everything

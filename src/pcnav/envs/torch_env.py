@@ -77,6 +77,9 @@ class PathConditionedNavEnv:
             min_goal_dist=config.maps.min_start_goal_geodesic_m,
             n_structures=config.maps.num_structures,
             min_detour_ratio=config.maps.min_detour_ratio,
+            use_maze=config.maps.use_maze,
+            maze_cell_size=config.maps.maze_cell_size_m,
+            maze_braid_fraction=config.maps.maze_braid_fraction,
         )
         self._pack_maps_to_device()
         self._load_path_library()

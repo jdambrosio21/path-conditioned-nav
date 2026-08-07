@@ -171,6 +171,124 @@ def _dead_end_corridor(rng: np.random.Generator, size: float) -> list[list[float
     ]
 
 
+def generate_maze(
+    rng: np.random.Generator,
+    size: float,
+    cell_size: float = 3.0,
+    braid_fraction: float = 0.18,
+    wall_thickness: float = 0.2,
+) -> np.ndarray:
+    """Generate a grid maze of rectangular corridors, as in the paper's figures.
+
+    A randomized depth-first carve produces a *perfect* maze -- exactly one route
+    between any two cells. That is the wrong object here: with a unique route, a
+    "suboptimal" reference path cannot exist and there is nothing to shortcut, so
+    the paper's central mechanism has no way to express itself.
+
+    So the maze is then **braided**: a fraction of interior walls is removed,
+    creating loops. Now multiple routes of differing length connect any two points
+    -- suboptimal paths are genuinely improvable, shortcuts genuinely exist, and
+    going the wrong way still costs a long detour.
+
+    Collinear runs are merged into single boxes. A 10x10 maze has ~180 candidate
+    walls; casting rays against each individually would dominate the step cost,
+    and merging typically cuts the count by two to three times.
+
+    Returns (W, 5) walls as (cx, cy, half_length, half_thickness, yaw).
+    """
+    n = max(2, int(round(size / cell_size)))
+    cell = size / n
+
+    # vertical[i][j]: wall between cell (i, j) and (i, j+1)
+    # horizontal[i][j]: wall between cell (i, j) and (i+1, j)
+    vertical = np.ones((n, n - 1), dtype=bool)
+    horizontal = np.ones((n - 1, n), dtype=bool)
+
+    # --- randomized depth-first carve ---
+    visited = np.zeros((n, n), dtype=bool)
+    start = (int(rng.integers(n)), int(rng.integers(n)))
+    stack = [start]
+    visited[start] = True
+
+    while stack:
+        i, j = stack[-1]
+        neighbours = []
+        if i > 0 and not visited[i - 1, j]:
+            neighbours.append((i - 1, j, "h", i - 1, j))
+        if i < n - 1 and not visited[i + 1, j]:
+            neighbours.append((i + 1, j, "h", i, j))
+        if j > 0 and not visited[i, j - 1]:
+            neighbours.append((i, j - 1, "v", i, j - 1))
+        if j < n - 1 and not visited[i, j + 1]:
+            neighbours.append((i, j + 1, "v", i, j))
+
+        if not neighbours:
+            stack.pop()
+            continue
+
+        ni, nj, kind, wi, wj = neighbours[rng.integers(len(neighbours))]
+        if kind == "h":
+            horizontal[wi, wj] = False
+        else:
+            vertical[wi, wj] = False
+        visited[ni, nj] = True
+        stack.append((ni, nj))
+
+    # --- braid: punch loops so alternative routes exist ---
+    for grid in (vertical, horizontal):
+        present = np.argwhere(grid)
+        if len(present) == 0:
+            continue
+        n_remove = int(len(present) * braid_fraction)
+        if n_remove:
+            for idx in rng.choice(len(present), size=n_remove, replace=False):
+                grid[tuple(present[idx])] = False
+
+    # --- merge collinear runs into single boxes ---
+    walls: list[list[float]] = []
+    half_thick = wall_thickness / 2
+
+    for j in range(n - 1):                      # vertical walls at x = (j+1)*cell
+        i = 0
+        while i < n:
+            if not vertical[i, j]:
+                i += 1
+                continue
+            run_start = i
+            while i < n and vertical[i, j]:
+                i += 1
+            length = (i - run_start) * cell
+            walls.append([
+                (j + 1) * cell,
+                (run_start * cell) + length / 2,
+                length / 2,
+                half_thick,
+                np.pi / 2,
+            ])
+
+    for i in range(n - 1):                      # horizontal walls at y = (i+1)*cell
+        j = 0
+        while j < n:
+            if not horizontal[i, j]:
+                j += 1
+                continue
+            run_start = j
+            while j < n and horizontal[i, j]:
+                j += 1
+            length = (j - run_start) * cell
+            walls.append([
+                (run_start * cell) + length / 2,
+                (i + 1) * cell,
+                length / 2,
+                half_thick,
+                0.0,
+            ])
+
+    if not walls:
+        return np.zeros((0, 5), dtype=np.float32)
+    return np.asarray(walls, dtype=np.float32)
+
+
 def generate_walls(
     rng: np.random.Generator, size: float, n_structures: tuple[int, int]
 ) -> np.ndarray:
@@ -256,13 +374,16 @@ def _largest_component(graph: csr_matrix, n_free: int) -> np.ndarray:
 def generate_map(
     rng: np.random.Generator,
     size: float = ARENA,
-    n_obstacles: tuple[int, int] = (18, 45),
-    radius: tuple[float, float] = (0.30, 1.60),
+    n_obstacles: tuple[int, int] = (0, 8),
+    radius: tuple[float, float] = (0.25, 0.60),
     n_goals: int = 8,
     n_starts: int = 12,
     min_goal_dist: float = 12.0,
     n_structures: tuple[int, int] = (2, 5),
     min_detour_ratio: float = 1.25,
+    use_maze: bool = True,
+    maze_cell_size: float = 3.0,
+    maze_braid_fraction: float = 0.18,
     _attempt: int = 0,
 ) -> MapData:
     """Generate one arena with candidate start/goal pairs and geodesic fields.
@@ -287,7 +408,8 @@ def generate_map(
         relaxed = max(1.0, min_detour_ratio - 0.05) if _attempt > 3 else min_detour_ratio
         return generate_map(
             rng, size, n_obstacles, radius, n_goals, n_starts, min_goal_dist,
-            n_structures, relaxed, _attempt + 1,
+            n_structures, relaxed, use_maze, maze_cell_size, maze_braid_fraction,
+            _attempt + 1,
         )
     m = int(rng.integers(*n_obstacles))
     obstacles = np.stack(
@@ -299,7 +421,10 @@ def generate_map(
         axis=1,
     ).astype(np.float32)
 
-    walls = generate_walls(rng, size, n_structures)
+    if use_maze:
+        walls = generate_maze(rng, size, maze_cell_size, maze_braid_fraction)
+    else:
+        walls = generate_walls(rng, size, n_structures)
 
     free = _inflated_free(obstacles, walls, size, RES)
     graph, idx = _grid_graph(free, RES)

@@ -136,14 +136,16 @@ def build_path_library(
                 start_xy = map_data.starts[start_idx]
                 optimal[map_idx, goal_idx, start_idx], optimal_len[map_idx, goal_idx, start_idx] = (
                     make_reference_path(
-                        map_data, roadmap, start_xy, goal_xy, PathQuality.OPTIMAL, rng
+                        map_data, roadmap, start_xy, goal_xy, PathQuality.OPTIMAL, rng,
+                        map_config.path_perturbation_m,
                     )
                 )
                 (
                     suboptimal[map_idx, goal_idx, start_idx],
                     suboptimal_len[map_idx, goal_idx, start_idx],
                 ) = make_reference_path(
-                    map_data, roadmap, start_xy, goal_xy, PathQuality.SUBOPTIMAL, rng
+                    map_data, roadmap, start_xy, goal_xy, PathQuality.SUBOPTIMAL, rng,
+                    map_config.path_perturbation_m,
                 )
         if progress and (map_idx + 1) % 20 == 0:
             print(f"  {map_idx + 1}/{num_maps} maps", flush=True)

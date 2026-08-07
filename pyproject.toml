@@ -31,6 +31,11 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E731"]  # lambda assignment is used deliberately for local tensor helpers
 
+[tool.ruff.lint.per-file-ignores]
+# Diagnostics are written to answer one question fast and be read once; density
+# beats formality there. Library code, scripts and tests hold the full standard.
+"tools/*" = ["E501", "E702"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
@@ -39,6 +44,7 @@ addopts = "-q"
 dev = [
     "imageio>=2.37.4",
     "imageio-ffmpeg>=0.6.0",
+    "matplotlib>=3.11.1",
     "pytest>=9.1.1",
     "ruff>=0.16.2",
 ]

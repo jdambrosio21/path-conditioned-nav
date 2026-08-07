@@ -89,8 +89,15 @@ class MapConfig:
 
     num_maps: int = 180                       # paper trains across 180 arenas
     arena_size_m: float = ARENA_SIZE_M
-    num_obstacles: tuple[int, int] = (18, 45)
-    obstacle_radius_m: tuple[float, float] = (0.30, 1.60)
+    # Maze corridors, matching the paper's figures ("50x50 m and 40x40 m maze
+    # environments", "walls creating complex corridor structures").
+    use_maze: bool = True
+    maze_cell_size_m: float = 3.0        # corridor pitch; width is this minus wall thickness
+    maze_braid_fraction: float = 0.18    # walls removed after carving, creating loops
+    # Scattered obstacles are kept sparse and small inside a maze: corridors are
+    # already narrow, and large circles would seal them.
+    num_obstacles: tuple[int, int] = (0, 8)
+    obstacle_radius_m: tuple[float, float] = (0.25, 0.60)
     goals_per_map: int = 8
     starts_per_goal: int = 12
     min_start_goal_geodesic_m: float = 12.0   # keeps every episode long-range
@@ -102,7 +109,10 @@ class MapConfig:
     # Minimum geodesic/straight-line ratio for a usable (start, goal) pair: the
     # route must actually require going around something.
     min_detour_ratio: float = 1.25
-    roadmap_nodes: int = 400
+    # Waypoint displacement for corrupted paths. The paper uses 1 m; our maze
+    # corridors are ~2.8 m wide, where that would push the path through walls.
+    path_perturbation_m: float = 0.4
+    roadmap_nodes: int = 1200   # narrow corridors need dense sampling to connect reliably
     roadmap_neighbors: int = 10
 
 

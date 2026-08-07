@@ -1,5 +1,6 @@
 """Which reward term dominates, per path condition?"""
-import torch, collections
+import collections
+
 from pcnav.algorithms import Runner
 from pcnav.config import EnvConfig, ExperimentConfig, MapConfig, PPOConfig, TrainConfig
 from pcnav.planning import PathQuality

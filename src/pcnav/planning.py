@@ -206,6 +206,7 @@ def make_reference_path(
     goal_xy: np.ndarray,
     quality: PathQuality,
     rng: np.random.Generator,
+    perturbation_m: float = 0.4,
 ) -> tuple[np.ndarray, int]:
     """Build one reference path, padded to (PATH_MAX, 2). Returns (path, n_valid).
 
@@ -218,8 +219,12 @@ def make_reference_path(
 
     s = int(prm.tree.query(start_xy)[1])
     if quality == PathQuality.WRONG_GOAL:
-        # A perfectly well-formed path -- to somewhere else entirely.
-        alt = md.goals[rng.integers(len(md.goals))]
+        # A perfectly well-formed path -- to somewhere else entirely. The true goal
+        # must be excluded: sampling uniformly over all goals sent ~1 in 8 of these
+        # paths to the correct destination, quietly diluting the condition that is
+        # supposed to be maximally misleading.
+        others = [i for i in range(len(md.goals)) if not np.allclose(md.goals[i], goal_xy)]
+        alt = md.goals[others[rng.integers(len(others))]] if others else goal_xy
         g = int(prm.tree.query(alt)[1])
     else:
         g = int(prm.tree.query(goal_xy)[1])
@@ -245,7 +250,11 @@ def make_reference_path(
 
     poly = resample(poly)
     if quality in (PathQuality.NOISY, PathQuality.SUBOPTIMAL, PathQuality.DETOURED):
-        poly = perturb(poly, rng, max_offset=1.0)
+        # The paper perturbs by up to 1 m. In a maze with ~2.8 m corridors that
+        # displacement puts most of the path inside walls, collapsing NOISY into an
+        # unusable path and erasing the distinction between corruption grades.
+        # Scaled down to stay a *plausible* misregistration, not a teleport.
+        poly = perturb(poly, rng, max_offset=perturbation_m)
 
     n = min(len(poly), PATH_MAX)
     out = empty.copy()

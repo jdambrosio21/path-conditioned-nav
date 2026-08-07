@@ -4,7 +4,8 @@ Trains short runs pinned to a single reference-path condition. If OPTIMAL alone
 learns, the fault is in the mixture or the encoder's interaction with it. If
 OPTIMAL alone fails while NONE learns, the fault is in the path pathway.
 """
-import sys, torch
+import sys
+
 from pcnav.algorithms import Runner
 from pcnav.config import EnvConfig, ExperimentConfig, MapConfig, PPOConfig, TrainConfig
 from pcnav.utils import seed_everything

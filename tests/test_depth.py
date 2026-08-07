@@ -210,7 +210,9 @@ def test_matches_2d_raycaster_on_horizontal_rays():
     env = PathConditionedNavEnv(
         EnvConfig(
             num_envs=8, device="cpu", seed=5,
-            maps=MapConfig(num_maps=3, num_structures=(0, 1)),
+            # Maze walls are oriented boxes, which the depth module does not yet
+            # cast against -- see docs/analytic-depth.md 6b.
+            maps=MapConfig(num_maps=3, use_maze=False, num_structures=(0, 1)),
         )
     )
     for i in range(env.num_envs):

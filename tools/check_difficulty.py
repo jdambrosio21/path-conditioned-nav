@@ -8,21 +8,31 @@ On an environment where local greedy navigation suffices, these score the same
 and path conditioning has nothing to demonstrate. The redesign is only justified
 if greedy now fails where pursuit succeeds.
 """
-import sys, torch
+import sys
+
+import torch
+
 from pcnav.config import EnvConfig, MapConfig
 from pcnav.envs.torch_env import PathConditionedNavEnv
 
-n_struct = (2, 5) if sys.argv[1] == "traps" else (0, 1)
-detour = 1.25 if sys.argv[1] == "traps" else 1.0
+use_maze = sys.argv[1] == "maze"
+detour = 1.25 if use_maze else 1.0
 
 for name in ["greedy", "pursuit"]:
     env = PathConditionedNavEnv(EnvConfig(
         num_envs=256, device="cpu", seed=42, fixed_path_quality="OPTIMAL",
-        maps=MapConfig(num_maps=10, num_structures=n_struct, min_detour_ratio=detour)))
+        maps=MapConfig(
+            num_maps=10, use_maze=use_maze, num_structures=(0, 1),
+            num_obstacles=(18, 45) if not use_maze else (0, 8),
+            obstacle_radius_m=(0.30, 1.60) if not use_maze else (0.25, 0.60),
+            min_detour_ratio=detour)))
     o = env.observe(); succ = coll = to = 0
     for _ in range(1500):
         goal_dir = o["obs"][:, 67:69]                 # cos/sin of goal bearing
-        wp, valid = o["path"][:, 2, :2], o["path"][:, 2, 2] > 0
+        # Lookahead index matters enormously in corridors: aiming far ahead cuts
+        # corners into walls. 1 m in a maze, 3 m in the open.
+        k = 0 if use_maze else 2
+        wp, valid = o["path"][:, k, :2], o["path"][:, k, 2] > 0
         if name == "greedy":
             bx, by = goal_dir[:, 0], goal_dir[:, 1]
         else:
