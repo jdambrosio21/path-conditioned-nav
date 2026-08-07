@@ -1,0 +1,228 @@
+"""Proximal Policy Optimization with an asymmetric critic.
+
+Structured after rsl-rl -- the library the paper uses -- including its adaptive
+learning-rate schedule, which nudges the step size to hold the policy KL near a
+target instead of following a fixed decay.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from ..config import PPOConfig
+from ..models.actor_critic import PathConditionedActorCritic
+
+# Observation tensors carried through the buffer, in the order the network wants.
+OBSERVATION_KEYS = ("obs", "path", "priv", "opt_path")
+
+
+def gaussian_kl(
+    old_mean: torch.Tensor,
+    old_std: torch.Tensor,
+    new_mean: torch.Tensor,
+    new_std: torch.Tensor,
+) -> torch.Tensor:
+    """Exact KL( old || new ) for diagonal Gaussians, summed over action dims.
+
+    Preferred over the ratio-based estimator for driving the learning-rate
+    schedule. The ratio estimator is heavy-tailed -- a few samples drawn far into
+    the tail of the old policy can dominate the batch mean and report a large KL
+    even when `clip_fraction` shows the update was tiny. This closed form depends
+    only on the distribution parameters, so it is bounded and noise-free.
+    """
+    variance_ratio = (old_std / new_std).pow(2)
+    mean_term = ((new_mean - old_mean) / new_std).pow(2)
+    return 0.5 * (variance_ratio + mean_term - 1.0 - variance_ratio.log()).sum(-1)
+
+
+class RolloutBuffer:
+    """Fixed-size on-policy storage, laid out as (steps, envs, ...) on device."""
+
+    def __init__(
+        self,
+        num_steps: int,
+        num_envs: int,
+        obs_shapes: dict[str, tuple[int, ...]],
+        action_dim: int,
+        device: torch.device,
+    ):
+        self.num_steps = num_steps
+        self.num_envs = num_envs
+        self.device = device
+        self.step = 0
+
+        self.observations = {
+            key: torch.zeros(num_steps, num_envs, *shape, device=device)
+            for key, shape in obs_shapes.items()
+        }
+        self.actions = torch.zeros(num_steps, num_envs, action_dim, device=device)
+        # Collection-time distribution parameters, kept for the exact KL computation.
+        self.action_means = torch.zeros(num_steps, num_envs, action_dim, device=device)
+        self.action_stds = torch.ones(num_steps, num_envs, action_dim, device=device)
+        self.log_probs = torch.zeros(num_steps, num_envs, device=device)
+        self.values = torch.zeros(num_steps, num_envs, device=device)
+        self.rewards = torch.zeros(num_steps, num_envs, device=device)
+        self.dones = torch.zeros(num_steps, num_envs, device=device)
+        self.advantages = torch.zeros(num_steps, num_envs, device=device)
+        self.returns = torch.zeros(num_steps, num_envs, device=device)
+
+    def add(
+        self,
+        observation: dict[str, torch.Tensor],
+        step_output: dict[str, torch.Tensor],
+        reward: torch.Tensor,
+        done: torch.Tensor,
+    ) -> None:
+        for key in self.observations:
+            self.observations[key][self.step] = observation[key]
+        self.actions[self.step] = step_output["action"]
+        self.action_means[self.step] = step_output["mean"]
+        self.action_stds[self.step] = step_output["std"]
+        self.log_probs[self.step] = step_output["log_prob"]
+        self.values[self.step] = step_output["value"]
+        self.rewards[self.step] = reward
+        self.dones[self.step] = done.float()
+        self.step += 1
+
+    def clear(self) -> None:
+        self.step = 0
+
+    def compute_returns(self, last_value: torch.Tensor, gamma: float, gae_lambda: float) -> None:
+        """Generalized Advantage Estimation, walked backwards through the rollout."""
+        running_advantage = torch.zeros(self.num_envs, device=self.device)
+        for t in reversed(range(self.num_steps)):
+            next_value = last_value if t == self.num_steps - 1 else self.values[t + 1]
+            not_done = 1.0 - self.dones[t]
+            delta = self.rewards[t] + gamma * next_value * not_done - self.values[t]
+            running_advantage = delta + gamma * gae_lambda * not_done * running_advantage
+            self.advantages[t] = running_advantage
+        self.returns = self.advantages + self.values
+
+    def minibatches(self, num_minibatches: int):
+        """Yield flattened, shuffled minibatches over the whole rollout."""
+        batch_size = self.num_steps * self.num_envs
+        minibatch_size = batch_size // num_minibatches
+        permutation = torch.randperm(batch_size, device=self.device)
+
+        flat_obs = {k: v.reshape(batch_size, *v.shape[2:]) for k, v in self.observations.items()}
+        flat_actions = self.actions.reshape(batch_size, -1)
+        flat_means = self.action_means.reshape(batch_size, -1)
+        flat_stds = self.action_stds.reshape(batch_size, -1)
+        flat_log_probs = self.log_probs.reshape(batch_size)
+        flat_advantages = self.advantages.reshape(batch_size)
+        flat_returns = self.returns.reshape(batch_size)
+        flat_values = self.values.reshape(batch_size)
+
+        # Normalize advantages once over the full batch, not per minibatch, so the
+        # scale is consistent across the epoch.
+        flat_advantages = (flat_advantages - flat_advantages.mean()) / (
+            flat_advantages.std() + 1e-8
+        )
+
+        for i in range(num_minibatches):
+            idx = permutation[i * minibatch_size : (i + 1) * minibatch_size]
+            yield {
+                "obs": {k: v[idx] for k, v in flat_obs.items()},
+                "actions": flat_actions[idx],
+                "old_means": flat_means[idx],
+                "old_stds": flat_stds[idx],
+                "old_log_probs": flat_log_probs[idx],
+                "advantages": flat_advantages[idx],
+                "returns": flat_returns[idx],
+                "old_values": flat_values[idx],
+            }
+
+
+class PPO:
+    """Clipped-surrogate PPO with value clipping and an adaptive KL-targeted LR."""
+
+    def __init__(self, policy: PathConditionedActorCritic, config: PPOConfig, device: torch.device):
+        self.policy = policy
+        self.config = config
+        self.device = device
+        self.learning_rate = config.learning_rate
+        self.optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate)
+
+    def update(self, buffer: RolloutBuffer) -> dict[str, float]:
+        cfg = self.config
+        stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "kl": 0.0, "clip_frac": 0.0}
+        num_updates = 0
+
+        for _ in range(cfg.num_epochs):
+            for batch in buffer.minibatches(cfg.num_minibatches):
+                obs = batch["obs"]
+                actions, advantages = batch["actions"], batch["advantages"]
+                old_log_probs, old_values = batch["old_log_probs"], batch["old_values"]
+                returns = batch["returns"]
+
+                log_probs, entropy, values, means, stds = self.policy.evaluate(obs, actions)
+
+                # --- clipped policy surrogate ---
+                ratio = (log_probs - old_log_probs).exp()
+                unclipped = ratio * advantages
+                clipped = ratio.clamp(1.0 - cfg.clip_ratio, 1.0 + cfg.clip_ratio) * advantages
+                policy_loss = -torch.min(unclipped, clipped).mean()
+
+                # --- clipped value loss ---
+                value_clipped = old_values + (values - old_values).clamp(
+                    -cfg.clip_ratio, cfg.clip_ratio
+                )
+                value_loss = torch.max(
+                    (values - returns).pow(2), (value_clipped - returns).pow(2)
+                ).mean()
+
+                entropy_bonus = entropy.mean()
+                loss = (
+                    policy_loss
+                    + cfg.value_loss_coef * value_loss
+                    - cfg.entropy_coef * entropy_bonus
+                )
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
+                self.optimizer.step()
+
+                with torch.no_grad():
+                    approx_kl = gaussian_kl(
+                        batch["old_means"], batch["old_stds"], means, stds
+                    ).mean()
+                    clip_fraction = ((ratio - 1.0).abs() > cfg.clip_ratio).float().mean()
+
+                stats["policy_loss"] += float(policy_loss.detach())
+                stats["value_loss"] += float(value_loss.detach())
+                stats["entropy"] += float(entropy_bonus.detach())
+                stats["kl"] += float(approx_kl)
+                stats["clip_frac"] += float(clip_fraction)
+                num_updates += 1
+
+        for key in stats:
+            stats[key] /= max(num_updates, 1)
+
+        # Adapt once per iteration on the mean KL. Adapting per minibatch compounds
+        # ~20 multiplicative steps per iteration and drives the LR into its floor
+        # within a handful of iterations, stalling learning outright.
+        if cfg.adaptive_lr:
+            self._adapt_learning_rate(stats["kl"])
+
+        stats["learning_rate"] = self.learning_rate
+        bounded_log_std = self.policy.log_std.clamp(*self.policy.log_std_bounds)
+        stats["action_std"] = float(bounded_log_std.exp().mean())
+        return stats
+
+    def _adapt_learning_rate(self, approx_kl: float) -> None:
+        """rsl-rl's schedule: shrink on KL overshoot, grow on undershoot.
+
+        The step is deliberately gentle. A 1.5x factor applied once per iteration
+        can traverse the entire allowed range in ~10 iterations, so a single noisy
+        KL reading strands the learning rate at a bound for the rest of the run.
+        """
+        low, high = self.config.lr_bounds
+        step = self.config.lr_adapt_factor
+        if approx_kl > self.config.target_kl * 2.0:
+            self.learning_rate = max(low, self.learning_rate / step)
+        elif 0.0 < approx_kl < self.config.target_kl / 2.0:
+            self.learning_rate = min(high, self.learning_rate * step)
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.learning_rate
