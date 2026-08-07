@@ -56,7 +56,12 @@ class EpisodeTracker:
         for quality_id, succeeded, collided in zip(
             quality.tolist(), success.tolist(), collision.tolist(), strict=True
         ):
-            reason = "success" if succeeded > 0.5 else ("collision" if collided > 0.5 else "timeout")
+            if succeeded > 0.5:
+                reason = "success"
+            elif collided > 0.5:
+                reason = "collision"
+            else:
+                reason = "timeout"
             self.terminations[int(quality_id)].append(reason)
         for quality_id, succeeded, length in zip(
             quality.tolist(), success.tolist(), episode_length[idx].tolist(), strict=True
