@@ -207,8 +207,9 @@ class PPO:
             self._adapt_learning_rate(stats["kl"])
 
         stats["learning_rate"] = self.learning_rate
-        bounded_log_std = self.policy.log_std.clamp(*self.policy.log_std_bounds)
-        stats["action_std"] = float(bounded_log_std.exp().mean())
+        with torch.no_grad():
+            bounded_log_std = self.policy.log_std.clamp(*self.policy.log_std_bounds)
+            stats["action_std"] = float(bounded_log_std.exp().mean())
         return stats
 
     def _adapt_learning_rate(self, approx_kl: float) -> None:
