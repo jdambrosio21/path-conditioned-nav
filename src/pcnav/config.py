@@ -157,6 +157,12 @@ class PolicyConfig:
     num_heads: int = 4
     encoder_layers: int = 1
     trunk_hidden: tuple[int, ...] = (256, 128)
+    # Spatially-Enhanced Recurrent Unit (Yang et al., arXiv:2506.05997) -- the base
+    # navigator this paper builds on. Memory matters in a maze: backing out of a
+    # dead end without immediately re-entering it requires remembering where you
+    # have been, which a feedforward policy simply cannot do.
+    use_recurrence: bool = True
+    memory_layers: int = 1
     init_log_std: float = -0.5
     log_std_bounds: tuple[float, float] = (-3.0, 0.0)
     # Temporally consistent dropout: resample the mask once per episode rather

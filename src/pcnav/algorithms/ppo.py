@@ -1,8 +1,15 @@
-"""Proximal Policy Optimization with an asymmetric critic.
+"""Proximal Policy Optimization with a recurrent, asymmetric critic.
 
 Structured after rsl-rl -- the library the paper uses -- including its adaptive
 learning-rate schedule, which nudges the step size to hold the policy KL near a
 target instead of following a fixed decay.
+
+Recurrence changes the minibatching, and the change is not optional. Feedforward
+PPO shuffles all (timestep, environment) transitions freely because each is
+independent. With memory they are not: a transition's meaning depends on the
+hidden state that preceded it, so a rollout must be replayed **in order, from a
+recorded starting state**. Minibatches are therefore taken over *environments*,
+each carrying its full time sequence.
 """
 
 from __future__ import annotations
@@ -14,7 +21,7 @@ from ..config import PPOConfig
 from ..models.actor_critic import PathConditionedActorCritic
 
 # Observation tensors carried through the buffer, in the order the network wants.
-OBSERVATION_KEYS = ("obs", "path", "priv", "opt_path")
+OBSERVATION_KEYS = ("obs", "path", "priv", "opt_path", "dropout_mask")
 
 
 def gaussian_kl(
@@ -37,7 +44,7 @@ def gaussian_kl(
 
 
 class RolloutBuffer:
-    """Fixed-size on-policy storage, laid out as (steps, envs, ...) on device."""
+    """On-policy storage, time-major as (steps, envs, ...) so sequences stay intact."""
 
     def __init__(
         self,
@@ -45,6 +52,8 @@ class RolloutBuffer:
         num_envs: int,
         obs_shapes: dict[str, tuple[int, ...]],
         action_dim: int,
+        memory_layers: int,
+        hidden_size: int,
         device: torch.device,
     ):
         self.num_steps = num_steps
@@ -57,7 +66,7 @@ class RolloutBuffer:
             for key, shape in obs_shapes.items()
         }
         self.actions = torch.zeros(num_steps, num_envs, action_dim, device=device)
-        # Collection-time distribution parameters, kept for the exact KL computation.
+        # Collection-time distribution parameters, for the exact KL computation.
         self.action_means = torch.zeros(num_steps, num_envs, action_dim, device=device)
         self.action_stds = torch.ones(num_steps, num_envs, action_dim, device=device)
         self.log_probs = torch.zeros(num_steps, num_envs, device=device)
@@ -66,6 +75,21 @@ class RolloutBuffer:
         self.dones = torch.zeros(num_steps, num_envs, device=device)
         self.advantages = torch.zeros(num_steps, num_envs, device=device)
         self.returns = torch.zeros(num_steps, num_envs, device=device)
+
+        # Only the hidden state entering step 0 is stored. The update replays the
+        # sequence forward from there, so intermediate states are recomputed under
+        # the current parameters rather than reused stale.
+        self.initial_actor_hidden = torch.zeros(
+            memory_layers, num_envs, hidden_size, device=device
+        )
+        self.initial_critic_hidden = torch.zeros(
+            memory_layers, num_envs, hidden_size, device=device
+        )
+
+    def start_rollout(self, actor_hidden: torch.Tensor, critic_hidden: torch.Tensor) -> None:
+        self.step = 0
+        self.initial_actor_hidden.copy_(actor_hidden)
+        self.initial_critic_hidden.copy_(critic_hidden)
 
     def add(
         self,
@@ -85,9 +109,6 @@ class RolloutBuffer:
         self.dones[self.step] = done.float()
         self.step += 1
 
-    def clear(self) -> None:
-        self.step = 0
-
     def compute_returns(self, last_value: torch.Tensor, gamma: float, gae_lambda: float) -> None:
         """Generalized Advantage Estimation, walked backwards through the rollout."""
         running_advantage = torch.zeros(self.num_envs, device=self.device)
@@ -99,38 +120,37 @@ class RolloutBuffer:
             self.advantages[t] = running_advantage
         self.returns = self.advantages + self.values
 
-    def minibatches(self, num_minibatches: int):
-        """Yield flattened, shuffled minibatches over the whole rollout."""
-        batch_size = self.num_steps * self.num_envs
-        minibatch_size = batch_size // num_minibatches
-        permutation = torch.randperm(batch_size, device=self.device)
+    def sequence_minibatches(self, num_minibatches: int):
+        """Yield minibatches of whole environment sequences, in timestep order.
 
-        flat_obs = {k: v.reshape(batch_size, *v.shape[2:]) for k, v in self.observations.items()}
-        flat_actions = self.actions.reshape(batch_size, -1)
-        flat_means = self.action_means.reshape(batch_size, -1)
-        flat_stds = self.action_stds.reshape(batch_size, -1)
-        flat_log_probs = self.log_probs.reshape(batch_size)
-        flat_advantages = self.advantages.reshape(batch_size)
-        flat_returns = self.returns.reshape(batch_size)
-        flat_values = self.values.reshape(batch_size)
+        Environments are shuffled between epochs but each keeps its full time
+        sequence, because replaying memory requires contiguous ordered transitions.
+        """
+        # Normalize advantages once over the full rollout, so the scale is
+        # consistent across minibatches rather than varying with each subset.
+        advantages = self.advantages
+        normalized = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Normalize advantages once over the full batch, not per minibatch, so the
-        # scale is consistent across the epoch.
-        flat_advantages = (flat_advantages - flat_advantages.mean()) / (
-            flat_advantages.std() + 1e-8
-        )
+        permutation = torch.randperm(self.num_envs, device=self.device)
+        size = max(1, self.num_envs // num_minibatches)
+        action_dim = self.actions.shape[-1]
 
         for i in range(num_minibatches):
-            idx = permutation[i * minibatch_size : (i + 1) * minibatch_size]
+            env_ids = permutation[i * size : (i + 1) * size]
+            if env_ids.numel() == 0:
+                continue
             yield {
-                "obs": {k: v[idx] for k, v in flat_obs.items()},
-                "actions": flat_actions[idx],
-                "old_means": flat_means[idx],
-                "old_stds": flat_stds[idx],
-                "old_log_probs": flat_log_probs[idx],
-                "advantages": flat_advantages[idx],
-                "returns": flat_returns[idx],
-                "old_values": flat_values[idx],
+                "obs": {k: v[:, env_ids] for k, v in self.observations.items()},
+                "actions": self.actions[:, env_ids],
+                "old_means": self.action_means[:, env_ids].reshape(-1, action_dim),
+                "old_stds": self.action_stds[:, env_ids].reshape(-1, action_dim),
+                "old_log_probs": self.log_probs[:, env_ids].reshape(-1),
+                "advantages": normalized[:, env_ids].reshape(-1),
+                "returns": self.returns[:, env_ids].reshape(-1),
+                "old_values": self.values[:, env_ids].reshape(-1),
+                "actor_hidden": self.initial_actor_hidden[:, env_ids],
+                "critic_hidden": self.initial_critic_hidden[:, env_ids],
+                "dones": self.dones[:, env_ids],
             }
 
 
@@ -150,13 +170,17 @@ class PPO:
         num_updates = 0
 
         for _ in range(cfg.num_epochs):
-            for batch in buffer.minibatches(cfg.num_minibatches):
-                obs = batch["obs"]
-                actions, advantages = batch["actions"], batch["advantages"]
-                old_log_probs, old_values = batch["old_log_probs"], batch["old_values"]
-                returns = batch["returns"]
+            for batch in buffer.sequence_minibatches(cfg.num_minibatches):
+                log_probs, entropy, values, means, stds = self.policy.evaluate_sequence(
+                    batch["obs"],
+                    batch["actions"],
+                    batch["actor_hidden"],
+                    batch["critic_hidden"],
+                    batch["dones"],
+                )
 
-                log_probs, entropy, values, means, stds = self.policy.evaluate(obs, actions)
+                advantages = batch["advantages"]
+                old_log_probs = batch["old_log_probs"]
 
                 # --- clipped policy surrogate ---
                 ratio = (log_probs - old_log_probs).exp()
@@ -165,6 +189,7 @@ class PPO:
                 policy_loss = -torch.min(unclipped, clipped).mean()
 
                 # --- clipped value loss ---
+                old_values, returns = batch["old_values"], batch["returns"]
                 value_clipped = old_values + (values - old_values).clamp(
                     -cfg.clip_ratio, cfg.clip_ratio
                 )
@@ -201,15 +226,15 @@ class PPO:
             stats[key] /= max(num_updates, 1)
 
         # Adapt once per iteration on the mean KL. Adapting per minibatch compounds
-        # ~20 multiplicative steps per iteration and drives the LR into its floor
-        # within a handful of iterations, stalling learning outright.
+        # ~20 multiplicative steps per iteration and drives the learning rate into
+        # its floor within a handful of iterations, stalling the run.
         if cfg.adaptive_lr:
             self._adapt_learning_rate(stats["kl"])
 
-        stats["learning_rate"] = self.learning_rate
         with torch.no_grad():
             bounded_log_std = self.policy.log_std.clamp(*self.policy.log_std_bounds)
             stats["action_std"] = float(bounded_log_std.exp().mean())
+        stats["learning_rate"] = self.learning_rate
         return stats
 
     def _adapt_learning_rate(self, approx_kl: float) -> None:

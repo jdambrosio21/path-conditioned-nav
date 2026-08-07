@@ -34,7 +34,7 @@ ignore = ["E731"]  # lambda assignment is used deliberately for local tensor hel
 [tool.ruff.lint.per-file-ignores]
 # Diagnostics are written to answer one question fast and be read once; density
 # beats formality there. Library code, scripts and tests hold the full standard.
-"tools/*" = ["E501", "E702"]
+"tools/*" = ["E501", "E701", "E702"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

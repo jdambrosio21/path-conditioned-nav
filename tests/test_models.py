@@ -58,6 +58,7 @@ def test_actor_critic_forward_shapes():
     batch = make_batch()
     out = policy.act(batch)
     assert out["action"].shape == (8, ACTION_DIM)
+    assert "actor_hidden_in" in out
     assert out["log_prob"].shape == (8,)
     assert out["value"].shape == (8,)
     assert out["mean"].shape == (8, ACTION_DIM)
@@ -71,13 +72,26 @@ def test_policy_handles_missing_path_without_nans():
     assert all(torch.isfinite(v).all() for v in out.values())
 
 
+def _sequence(batch: dict[str, torch.Tensor], envs: int = 8) -> dict[str, torch.Tensor]:
+    """Wrap a single-step batch as a length-1 time-major sequence."""
+    out = {k: v.unsqueeze(0) for k, v in batch.items()}
+    out.setdefault("dropout_mask", torch.ones(envs, OBS_DIM).unsqueeze(0))
+    if out["dropout_mask"].dim() == 2:
+        out["dropout_mask"] = out["dropout_mask"].unsqueeze(0)
+    return out
+
+
 def test_evaluate_matches_act_under_a_fixed_action():
     """Re-scoring a stored action must reproduce its log-prob deterministically."""
     policy = PathConditionedActorCritic(PolicyConfig(dropout=0.0), num_envs=8).eval()
     batch = make_batch()
-    action = torch.zeros(8, ACTION_DIM)
-    first_log_prob, _, first_value, _, _ = policy.evaluate(batch, action)
-    second_log_prob, _, second_value, _, _ = policy.evaluate(batch, action)
+    action = torch.zeros(1, 8, ACTION_DIM)
+    args = (
+        _sequence(batch), action,
+        policy.actor_hidden.clone(), policy.critic_hidden.clone(), torch.zeros(1, 8),
+    )
+    first_log_prob, _, first_value, _, _ = policy.evaluate_sequence(*args)
+    second_log_prob, _, second_value, _, _ = policy.evaluate_sequence(*args)
     assert torch.allclose(first_log_prob, second_log_prob)
     assert torch.allclose(first_value, second_value)
 
@@ -86,8 +100,8 @@ def test_critic_uses_privileged_input():
     """Changing privileged state must move the value estimate."""
     policy = PathConditionedActorCritic(PolicyConfig(dropout=0.0), num_envs=8).eval()
     batch = make_batch()
-    baseline = policy.value(batch["obs"], batch["priv"], batch["opt_path"], batch["path"])
-    altered = policy.value(batch["obs"], batch["priv"] + 1.0, batch["opt_path"], batch["path"])
+    baseline = policy.bootstrap_value(batch)
+    altered = policy.bootstrap_value({**batch, "priv": batch["priv"] + 1.0})
     assert not torch.allclose(baseline, altered, atol=1e-5)
 
 
@@ -101,9 +115,8 @@ def test_critic_distinguishes_episodes_by_the_path_the_actor_saw():
     """
     policy = PathConditionedActorCritic(PolicyConfig(dropout=0.0), num_envs=8).eval()
     batch = make_batch()
-    absent = torch.zeros_like(batch["path"])
-    with_path = policy.value(batch["obs"], batch["priv"], batch["opt_path"], batch["path"])
-    without_path = policy.value(batch["obs"], batch["priv"], batch["opt_path"], absent)
+    with_path = policy.bootstrap_value(batch)
+    without_path = policy.bootstrap_value({**batch, "path": torch.zeros_like(batch["path"])})
     assert not torch.allclose(with_path, without_path, atol=1e-5)
 
 
@@ -111,8 +124,8 @@ def test_temporally_consistent_dropout_mask_is_stable_between_resamples():
     policy = PathConditionedActorCritic(PolicyConfig(dropout=0.2), num_envs=16)
     policy.obs_dropout.resample()
     first = policy.obs_dropout.current_mask.clone()
-    obs = torch.randn(16, OBS_DIM)
-    policy.action_mean(obs, make_batch(16)["path"])
+
+    policy.act_deterministic(make_batch(16))
     assert torch.equal(policy.obs_dropout.current_mask, first)  # unchanged by a forward
 
     policy.obs_dropout.resample()
@@ -121,15 +134,20 @@ def test_temporally_consistent_dropout_mask_is_stable_between_resamples():
 
 def test_stored_mask_reproduces_collection_time_network():
     """Replaying a stored mask must reproduce the exact action that was sampled."""
-    policy = PathConditionedActorCritic(PolicyConfig(dropout=0.3), num_envs=8)
+    policy = PathConditionedActorCritic(PolicyConfig(dropout=0.3), num_envs=8).eval()
+    policy.reset_hidden()
     policy.obs_dropout.resample()
+
     batch = make_batch()
-    stored_mask = policy.obs_dropout.current_mask.clone()
-    original = policy.action_mean(batch["obs"], batch["path"], stored_mask)
+    batch["dropout_mask"] = policy.obs_dropout.current_mask.clone()
+    hidden = (policy.actor_hidden.clone(), policy.critic_hidden.clone())
+    original = policy.act(batch)["mean"]
 
     policy.obs_dropout.resample()  # mask moves on, as it would after an episode ends
-    replayed = policy.action_mean(batch["obs"], batch["path"], stored_mask)
-    assert torch.allclose(original, replayed, atol=1e-6)
+    replayed = policy.evaluate_sequence(
+        _sequence(batch), original.unsqueeze(0), hidden[0], hidden[1], torch.zeros(1, 8)
+    )[3]
+    assert torch.allclose(original, replayed, atol=1e-5)
 
 
 def test_gaussian_kl_is_zero_for_identical_distributions_and_positive_otherwise():
@@ -152,5 +170,5 @@ def test_log_std_is_clamped_within_bounds():
     policy = PathConditionedActorCritic(_PolicyConfig(dropout=0.0), num_envs=4).eval()
     with torch.no_grad():
         policy.log_std.fill_(50.0)
-    std = policy.distribution(torch.randn(4, OBS_DIM), make_batch(4)["path"]).stddev
+    std = policy.act(make_batch(4))["std"]
     assert torch.all(std <= torch.tensor(policy.log_std_bounds[1]).exp() + 1e-5)

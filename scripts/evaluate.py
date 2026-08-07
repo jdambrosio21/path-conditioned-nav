@@ -78,6 +78,7 @@ def load_policy(checkpoint_path: Path, num_envs: int, device: str):
     policy.eval()
     # Dropout is a training-time regularizer only; disable it for evaluation.
     policy.obs_dropout.drop_prob = 0.0
+    policy.reset_hidden()
     return policy, config
 
 
@@ -98,6 +99,9 @@ def evaluate_condition(env, policy, target_episodes: int) -> dict[str, float]:
     while completed < target_episodes:
         action = policy.act_deterministic(observation)
         observation, _, done, info = env.step(action)
+        # Recurrent memory is episode-scoped: carrying it across a reset would let
+        # the policy "remember" a maze it is no longer standing in.
+        policy.reset_hidden(done)
         step_counter += 1
 
         if bool(done.any()):

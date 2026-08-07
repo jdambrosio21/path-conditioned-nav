@@ -88,6 +88,7 @@ class PolicyViewer:
                 with torch.no_grad():
                     action = self.policy.act_deterministic(observation)
                 observation, reward, done, info = self.env.step(action)
+                self.policy.reset_hidden(done)
 
                 # A reset swaps in a freshly compiled model, so the viewer must be
                 # rebound; MuJoCo's passive viewer cannot swap models in place.
@@ -149,6 +150,7 @@ def render_episode_frames(
         with torch.no_grad():
             action = policy.act_deterministic(observation)
         observation, _, done, info = env.step(action)
+        policy.reset_hidden(done)
 
         camera.lookat[:] = [float(env.position[env_id, 0]), float(env.position[env_id, 1]), 0.0]
         renderer.update_scene(data, camera=camera)

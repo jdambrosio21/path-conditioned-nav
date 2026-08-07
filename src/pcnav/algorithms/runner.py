@@ -35,8 +35,11 @@ class Runner:
             num_envs=config.env.num_envs,
             obs_shapes=obs_shapes,
             action_dim=ACTION_DIM,
+            memory_layers=self.policy.memory_layers,
+            hidden_size=self.policy.hidden_size,
             device=self.device,
         )
+        self.policy.reset_hidden()
 
         self.tracker = EpisodeTracker()
         self.run_dir = Path(config.train.run_dir) / config.train.run_name
@@ -59,8 +62,16 @@ class Runner:
         return {**observation, "dropout_mask": self.policy.obs_dropout.current_mask.clone()}
 
     def collect_rollout(self, observation: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Run `rollout_steps` environment steps, filling the buffer."""
-        self.buffer.clear()
+        """Run `rollout_steps` environment steps, filling the buffer.
+
+        The memory state entering the rollout is recorded once here; the update
+        replays each sequence forward from it.
+        """
+        if self.policy.recurrent:
+            self.buffer.start_rollout(self.policy.actor_hidden, self.policy.critic_hidden)
+        else:
+            zeros = torch.zeros_like(self.buffer.initial_actor_hidden)
+            self.buffer.start_rollout(zeros, zeros)
 
         for _ in range(self.config.ppo.rollout_steps):
             observation = self._attach_dropout_mask(observation)
@@ -74,7 +85,10 @@ class Runner:
             self.tracker.record(done, info, self._episode_return, self._episode_length)
 
             # Reset per-episode accumulators for environments that just finished,
-            # and give them fresh temporally-consistent dropout masks.
+            # give them fresh temporally-consistent dropout masks, and clear their
+            # recurrent memory -- carrying a hidden state across an episode boundary
+            # would let the policy "remember" a maze it is no longer in.
+            self.policy.reset_hidden(done)
             if bool(done.any()):
                 finished = done.nonzero(as_tuple=True)[0]
                 self._episode_return[finished] = 0.0
@@ -96,13 +110,7 @@ class Runner:
         for iteration in range(1, config.train.total_iterations + 1):
             observation = self.collect_rollout(observation)
 
-            with torch.no_grad():
-                last_value = self.policy.value(
-                    observation["obs"],
-                    observation["priv"],
-                    observation["opt_path"],
-                    observation["path"],
-                )
+            last_value = self.policy.bootstrap_value(observation)
             self.buffer.compute_returns(last_value, config.ppo.gamma, config.ppo.gae_lambda)
 
             stats = self.algorithm.update(self.buffer)
