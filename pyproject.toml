@@ -37,6 +37,8 @@ addopts = "-q"
 
 [dependency-groups]
 dev = [
+    "imageio>=2.37.4",
+    "imageio-ffmpeg>=0.6.0",
     "pytest>=9.1.1",
     "ruff>=0.16.2",
 ]

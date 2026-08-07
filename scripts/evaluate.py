@@ -53,7 +53,25 @@ def load_policy(checkpoint_path: Path, num_envs: int, device: str):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = ExperimentConfig.from_dict(checkpoint["config"])
     policy = PathConditionedActorCritic(config.policy, num_envs).to(device)
-    policy.load_state_dict(checkpoint["policy"])
+
+    # strict=False tolerates missing and unexpected keys but still raises on a
+    # *shape* mismatch, so incompatible tensors are dropped explicitly.
+    current = policy.state_dict()
+    saved = checkpoint["policy"]
+    compatible = {k: v for k, v in saved.items() if k in current and current[k].shape == v.shape}
+    reshaped = [k for k in saved if k in current and current[k].shape != saved[k].shape]
+    missing, unexpected = policy.load_state_dict(compatible, strict=False)
+    missing = list(missing) + reshaped
+    # Checkpoints outlive architectures. Loading leniently keeps older runs
+    # inspectable, but any mismatch is reported rather than swallowed -- and a
+    # mismatch in the *actor* means the loaded policy is not the one that trained.
+    if missing or unexpected:
+        actor_affected = [k for k in list(missing) + list(unexpected) if k.startswith("actor")]
+        print(f"  checkpoint/architecture mismatch: {len(missing)} missing, {len(unexpected)} unexpected")
+        if actor_affected:
+            print(f"  WARNING: actor weights affected: {actor_affected}")
+        else:
+            print("  (critic only -- actor intact, safe for evaluation and visualization)")
     policy.eval()
     # Dropout is a training-time regularizer only; disable it for evaluation.
     policy.obs_dropout.drop_prob = 0.0

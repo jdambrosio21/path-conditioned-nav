@@ -120,28 +120,48 @@ def render_episode_frames(
     width: int = 960,
     height: int = 640,
     max_steps: int = 300,
-) -> list[np.ndarray]:
+    camera_distance: float = 14.0,
+    camera_elevation: float = -55.0,
+) -> tuple[list[np.ndarray], str]:
     """Offscreen render of one episode, for saving video without a display.
 
-    Returns a list of RGB frames.
+    The camera tracks the robot from above and behind. A fixed world camera is
+    nearly useless on a 30 m arena -- the robot ends up a few pixels across, and
+    the behaviour you are trying to diagnose becomes invisible.
+
+    Returns (frames, outcome).
     """
     mujoco = env.mujoco
     model = env.models[env_id]
     data = env.datas[env_id]
     renderer = mujoco.Renderer(model, height=height, width=width)
 
+    camera = mujoco.MjvCamera()
+    camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+    camera.distance = camera_distance
+    camera.elevation = camera_elevation
+
     frames: list[np.ndarray] = []
     observation = env.observe()
+    outcome = "timeout"
 
     for _ in range(max_steps):
         with torch.no_grad():
             action = policy.act_deterministic(observation)
-        observation, _, done, _ = env.step(action)
+        observation, _, done, info = env.step(action)
 
-        renderer.update_scene(data)
+        camera.lookat[:] = [float(env.position[env_id, 0]), float(env.position[env_id, 1]), 0.0]
+        renderer.update_scene(data, camera=camera)
         frames.append(renderer.render().copy())
+
         if bool(done[env_id]):
+            if bool(info["success"][env_id]):
+                outcome = "success"
+            elif bool(info["tipped_over"][env_id]):
+                outcome = "tipped"
+            elif bool(info["collision"][env_id]):
+                outcome = "collision"
             break
 
     renderer.close()
-    return frames
+    return frames, outcome

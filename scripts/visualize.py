@@ -66,9 +66,10 @@ def main() -> None:
     from pcnav.sim.viewer import PolicyViewer, render_episode_frames
 
     if args.record:
-        frames = render_episode_frames(env, policy)
+        PolicyViewer(env, policy)._update_markers(env.models[0], env.datas[0])
+        frames, outcome = render_episode_frames(env, policy)
         _write_video(frames, args.record)
-        print(f"wrote {args.record} ({len(frames)} frames)")
+        print(f"wrote {args.record}  ({len(frames)} frames, outcome: {outcome})")
         return
 
     print(f"visualizing condition: {args.quality}  (close the window to stop)")

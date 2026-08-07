@@ -104,6 +104,12 @@ def build_scene_xml(
   <compiler angle="radian" autolimits="true"/>
   <option timestep="0.002" integrator="implicitfast" cone="elliptic"/>
 
+  <!-- The offscreen framebuffer defaults to 640x480; recording at a larger size
+       fails at render time unless it is declared here. -->
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+  </visual>
+
   <default>
     <geom condim="4" friction="1.0 0.01 0.001"/>
   </default>
