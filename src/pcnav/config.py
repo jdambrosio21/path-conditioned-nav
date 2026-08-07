@@ -175,6 +175,9 @@ class TrainConfig:
     checkpoint_interval: int = 200
     run_dir: str = "runs"
     run_name: str = "pcnav"
+    # Path to a checkpoint to warm-start from. The paper builds on a pretrained
+    # navigation base rather than starting from random weights.
+    init_from: str | None = None
 
 
 @dataclass

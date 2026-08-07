@@ -45,6 +45,9 @@ class Runner:
             json.dumps(config.to_dict(), indent=2, default=str)
         )
 
+        if config.train.init_from:
+            self.load_policy_weights(Path(config.train.init_from))
+
         self.total_env_steps = 0
         self._episode_return = torch.zeros(config.env.num_envs, device=self.device)
         self._episode_length = torch.zeros(config.env.num_envs, device=self.device)
@@ -124,6 +127,24 @@ class Runner:
         self.save_checkpoint(config.train.total_iterations, final=True)
 
     # ------------------------------------------------------------ checkpoints
+
+    def load_policy_weights(self, checkpoint_path: Path) -> None:
+        """Warm-start from a previously trained policy.
+
+        The paper does not train from scratch: it extends a pre-trained navigation
+        base (Yang et al. 2025, including a pretrained depth encoder) and learns
+        the path-encoding module on top. Learning obstacle avoidance, goal seeking
+        and path-quality discrimination simultaneously from random weights is a
+        materially harder problem than the one the paper solves.
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        missing, unexpected = self.policy.load_state_dict(checkpoint["policy"], strict=False)
+        print(
+            f"warm-started from {checkpoint_path} "
+            f"({checkpoint.get('env_steps', 0):,} env steps; "
+            f"{len(missing)} missing, {len(unexpected)} unexpected keys)",
+            flush=True,
+        )
 
     def save_checkpoint(self, iteration: int, final: bool = False) -> None:
         name = "policy_final.pt" if final else f"policy_{iteration:06d}.pt"

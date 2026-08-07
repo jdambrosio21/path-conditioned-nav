@@ -35,6 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", default="runs")
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--checkpoint-interval", type=int, default=200)
+    parser.add_argument(
+        "--fixed-quality", default=None,
+        help="pin one reference-path condition (e.g. NONE) instead of sampling the mixture",
+    )
+    parser.add_argument(
+        "--init-from", default=None,
+        help="warm-start from a checkpoint, as the paper does from a pretrained base",
+    )
     return parser.parse_args()
 
 
@@ -59,6 +67,7 @@ def main() -> None:
             device=device,
             seed=args.seed,
             maps=MapConfig(num_maps=args.num_maps),
+            fixed_path_quality=args.fixed_quality,
         ),
         ppo=PPOConfig(rollout_steps=args.rollout_steps),
         train=TrainConfig(
@@ -67,6 +76,7 @@ def main() -> None:
             run_name=args.run_name,
             log_interval=args.log_interval,
             checkpoint_interval=args.checkpoint_interval,
+            init_from=args.init_from,
         ),
     )
 

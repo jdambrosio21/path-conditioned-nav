@@ -86,12 +86,20 @@ edges) and draws two grades of route from it:
   needlessly long corridor.
 - Waypoints are then perturbed by up to **1 m**, modelling registration error.
 
-> **The design lesson.** The corruptions must be *plausible*. IID per-waypoint noise
-> produces a zigzag no planner would ever emit — the policy would learn "zigzag ⇒
-> ignore", a cue that does not exist in deployment. Smooth displacement models the real
-> defect: a correct path registered against a misaligned map. **Your corruption model is
-> a claim about how the upstream system fails.** Get it wrong and you train robustness to
-> a fiction.
+> **A deviation, and the reasoning.** The paper applies perturbations *"independently to
+> each waypoint"* — IID noise. We instead apply a smooth displacement along the path.
+>
+> The argument for smooth: IID noise produces a zigzag no planner would ever emit, so the
+> policy could learn "zigzag ⇒ ignore" — a cue that does not exist in deployment. Smooth
+> displacement models the defect we think is real: a correct path registered against a
+> misaligned map.
+>
+> The argument for IID (theirs): it is a strictly harsher, less structured perturbation,
+> and it does not bake in an assumption about *which* failure mode dominates.
+>
+> This is an open choice, not a settled one — worth running both ways. Either way the
+> general point holds: **your corruption model is a claim about how the upstream system
+> fails**, and robustness is only ever robustness to the perturbations you trained on.
 
 *Ours:* `planning.py` (`build_prm`, `astar`, `gbfs_biased`, `perturb`), plus the extra
 degraded conditions the ablation needs in `PathQuality`.
@@ -181,6 +189,28 @@ it doubles training cost for a regularization effect, and it is orthogonal to th
 
 Training: 1046 parallel agents, 180 procedural arenas, 30×30 m for training and 50×50 m
 for evaluation, 60 s episodes (120 s at evaluation), 39.5 h on one RTX 4090.
+
+**Two details that are easy to miss and matter enormously for reproduction:**
+
+- **There is no curriculum.** *"No dedicated curriculum is employed; instead, domain
+  randomization is applied to the policy inputs to enhance sim-to-real generalization."*
+- **The policy is not trained from scratch.** It extends a pre-trained navigation base
+  from prior work (Yang et al. 2025), including a *pretrained depth image encoder*; the
+  path-encoding module is learned on top of an already-competent navigator.
+
+The second point is the one that bit this reimplementation. Training from random weights
+means learning obstacle avoidance, goal seeking, *and* path-quality discrimination at
+once — and the last of those is only learnable once the first two work, because telling a
+good path from a misleading one requires sensor evidence the policy cannot yet interpret.
+Mixed-condition training stalled here at 0% on every path condition while each condition
+in isolation reached >0.95. The fix that matches the paper is a warm start, not a
+curriculum: see `TrainConfig.init_from`.
+
+**The mixture proportions are not published.** The paper says only that *"the sampling
+probability and the bias parameter β shape the distribution of reference paths and
+therefore influence the learning dynamics."* The split used here (30/25/20/10/5/10) is
+our invention, and by the paper's own admission that choice affects whether training
+works.
 
 The experiment that matters is the **path-quality sweep**. The predicted signature:
 
