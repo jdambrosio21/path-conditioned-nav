@@ -16,7 +16,13 @@ import numpy as np
 # --------------------------------------------------------------------------
 # Physical constants of the wheeled platform (B2W-scale)
 # --------------------------------------------------------------------------
-ARENA_SIZE_M = 30.0          # paper's training arena edge length
+# The paper trains on 30x30 m and evaluates on 40x40 and 50x50. We train at 45 m
+# because 30 m proved too small to measure anything: with 10 m of sensor range the
+# robot perceives a third of the world, and a *path-blind* feedforward policy
+# solved those mazes at 0.97 -- leaving no headroom for path conditioning to show
+# an effect. Larger arena, sparser loops and a tighter time budget together make
+# blind search actually fail.
+ARENA_SIZE_M = 45.0
 GRID_RESOLUTION_M = 0.25     # occupancy grid / geodesic field cell size
 ROBOT_RADIUS_M = 0.35        # footprint half-width, used to inflate obstacles
 
@@ -44,8 +50,10 @@ SENSOR_MAX_RANGE_M = 10.0                   # paper's max depth range
 # --------------------------------------------------------------------------
 # Reference path discretization
 # --------------------------------------------------------------------------
-PATH_VERTEX_SPACING_M = 0.25   # polyline resample spacing
-MAX_PATH_VERTICES = 256        # padded length (= 64 m of path)
+# Routes in a 45 m maze run well past 100 m, so the polyline is coarser and longer:
+# 0.25 m x 256 vertices covered only 64 m and would silently truncate.
+PATH_VERTEX_SPACING_M = 0.5    # polyline resample spacing
+MAX_PATH_VERTICES = 512        # padded length (= 256 m of path)
 NUM_WAYPOINTS = 15             # waypoints exposed to the policy (paper)
 WAYPOINT_SPACING_M = 1.0       # arclength between consecutive waypoints
 
@@ -53,7 +61,10 @@ WAYPOINT_SPACING_M = 1.0       # arclength between consecutive waypoints
 # Episode termination
 # --------------------------------------------------------------------------
 GOAL_RADIUS_M = 1.0
-EPISODE_DURATION_S = 60.0      # paper's training episode length
+# 60 s allowed 120 m of travel for 40-60 m routes -- two to three times the budget
+# actually needed, so wandering until you stumble onto the goal was a winning
+# strategy. Tightened relative to route length so the time budget binds.
+EPISODE_DURATION_S = 90.0
 MAX_EPISODE_STEPS = int(EPISODE_DURATION_S * NAV_POLICY_HZ)
 
 # Derived tensor dimensions.
@@ -87,20 +98,23 @@ class RewardConfig:
 class MapConfig:
     """Procedural arena generation."""
 
-    num_maps: int = 180                       # paper trains across 180 arenas
+    num_maps: int = 80                        # fewer, larger arenas
     arena_size_m: float = ARENA_SIZE_M
     # Maze corridors, matching the paper's figures ("50x50 m and 40x40 m maze
     # environments", "walls creating complex corridor structures").
     use_maze: bool = True
     maze_cell_size_m: float = 3.0        # corridor pitch; width is this minus wall thickness
-    maze_braid_fraction: float = 0.18    # walls removed after carving, creating loops
+    # Braiding trades dead ends for loops. Too much and the maze stops trapping a
+    # blind searcher; too little and the route becomes unique, leaving nothing for
+    # a "suboptimal" path to be suboptimal *relative to* and nothing to shortcut.
+    maze_braid_fraction: float = 0.08
     # Scattered obstacles are kept sparse and small inside a maze: corridors are
     # already narrow, and large circles would seal them.
     num_obstacles: tuple[int, int] = (0, 8)
     obstacle_radius_m: tuple[float, float] = (0.25, 0.60)
     goals_per_map: int = 8
     starts_per_goal: int = 12
-    min_start_goal_geodesic_m: float = 12.0   # keeps every episode long-range
+    min_start_goal_geodesic_m: float = 25.0   # keeps every episode long-range
     # Trap structures (U-pockets, gapped barriers, dead-end corridors) per arena.
     # Scattered convex obstacles alone leave the task solvable by driving at the
     # goal, which makes reference paths worthless and the paper's effect
@@ -112,7 +126,7 @@ class MapConfig:
     # Waypoint displacement for corrupted paths. The paper uses 1 m; our maze
     # corridors are ~2.8 m wide, where that would push the path through walls.
     path_perturbation_m: float = 0.4
-    roadmap_nodes: int = 1200   # narrow corridors need dense sampling to connect reliably
+    roadmap_nodes: int = 2000   # scales with area; narrow corridors need dense sampling
     roadmap_neighbors: int = 10
 
 

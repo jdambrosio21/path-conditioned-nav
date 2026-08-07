@@ -52,6 +52,18 @@ def load_policy(checkpoint_path: Path, num_envs: int, device: str):
     """Restore a policy and the config it was trained under."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = ExperimentConfig.from_dict(checkpoint["config"])
+
+    # Infer recurrence from the weights rather than the saved config. Checkpoints
+    # predate the SRU, so their config omits the flag and picks up the current
+    # default -- which would build a recurrent policy around randomly initialized
+    # memory and silently evaluate a network that never trained.
+    from dataclasses import replace
+
+    has_memory = any(k.startswith("actor_memory") for k in checkpoint["policy"])
+    if has_memory != config.policy.use_recurrence:
+        print(f"  checkpoint is {'recurrent' if has_memory else 'feedforward'}; matching it")
+        config = replace(config, policy=replace(config.policy, use_recurrence=has_memory))
+
     policy = PathConditionedActorCritic(config.policy, num_envs).to(device)
 
     # strict=False tolerates missing and unexpected keys but still raises on a

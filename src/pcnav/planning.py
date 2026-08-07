@@ -66,10 +66,53 @@ def _segment_free(a: np.ndarray, b: np.ndarray, free: np.ndarray, res: float = R
     return bool(free[rc[:, 0], rc[:, 1]].all())
 
 
-def build_prm(md: MapData, rng: np.random.Generator, n_nodes: int = 400, k: int = 10) -> PRM:
-    """Sample a roadmap over free space and connect each node to its k nearest."""
+def build_prm(
+    md: MapData,
+    rng: np.random.Generator,
+    n_nodes: int = 400,
+    k: int = 10,
+    node_spacing: float = 0.7,
+) -> PRM:
+    """Build a roadmap over free space, connecting each node to its k nearest.
+
+    Nodes are drawn by **stratified** sampling -- free space is divided into cells
+    of `node_spacing` metres and one random free point is taken from each -- rather
+    than sampled uniformly at random.
+
+    Uniform sampling makes connectivity a lottery. In a maze, corridors are narrow
+    and a uniform draw routinely leaves one with no node in it, disconnecting the
+    roadmap even though free space is perfectly connected. That failure is silent:
+    A* simply returns nothing, `make_reference_path` yields an empty path, and the
+    episode quietly downgrades from OPTIMAL to "no path at all". Measured here, 42
+    of 92 start/goal pairs on one 45 m maze failed that way, while a different
+    random seed on the same map produced a fully connected roadmap -- which is
+    exactly the kind of bug that hides until it poisons a result.
+
+    Stratification guarantees coverage: every reachable pocket of free space larger
+    than one cell contains a node.
+    """
     free_rc = np.argwhere(md.free)
-    pick = rng.choice(len(free_rc), size=min(n_nodes, len(free_rc)), replace=False)
+    if len(free_rc) == 0:
+        raise ValueError("map has no free space")
+
+    stride = max(1, int(round(node_spacing / md.res)))
+    bucket = (free_rc[:, 0] // stride) * (md.free.shape[1] + 1) + (free_rc[:, 1] // stride)
+
+    # One random free cell per bucket: shuffle, then take the first occurrence of
+    # each bucket id.
+    order = rng.permutation(len(free_rc))
+    _, first_in_bucket = np.unique(bucket[order], return_index=True)
+    pick = order[first_in_bucket]
+
+    # Top up with extra random nodes if the budget allows, for path variety.
+    if n_nodes > len(pick):
+        remaining = np.setdiff1d(np.arange(len(free_rc)), pick, assume_unique=False)
+        if len(remaining):
+            extra = rng.choice(
+                remaining, size=min(n_nodes - len(pick), len(remaining)), replace=False
+            )
+            pick = np.concatenate([pick, extra])
+
     nodes = (free_rc[pick][:, ::-1].astype(np.float64) + 0.5) * md.res
 
     tree = cKDTree(nodes)

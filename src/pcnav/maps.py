@@ -175,7 +175,7 @@ def generate_maze(
     rng: np.random.Generator,
     size: float,
     cell_size: float = 3.0,
-    braid_fraction: float = 0.18,
+    braid_fraction: float = 0.08,
     wall_thickness: float = 0.2,
 ) -> np.ndarray:
     """Generate a grid maze of rectangular corridors, as in the paper's figures.
@@ -378,12 +378,12 @@ def generate_map(
     radius: tuple[float, float] = (0.25, 0.60),
     n_goals: int = 8,
     n_starts: int = 12,
-    min_goal_dist: float = 12.0,
+    min_goal_dist: float = 25.0,
     n_structures: tuple[int, int] = (2, 5),
     min_detour_ratio: float = 1.25,
     use_maze: bool = True,
     maze_cell_size: float = 3.0,
-    maze_braid_fraction: float = 0.18,
+    maze_braid_fraction: float = 0.08,
     _attempt: int = 0,
 ) -> MapData:
     """Generate one arena with candidate start/goal pairs and geodesic fields.
