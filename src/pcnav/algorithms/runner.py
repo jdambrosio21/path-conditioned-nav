@@ -95,7 +95,10 @@ class Runner:
 
             with torch.no_grad():
                 last_value = self.policy.value(
-                    observation["obs"], observation["priv"], observation["opt_path"]
+                    observation["obs"],
+                    observation["priv"],
+                    observation["opt_path"],
+                    observation["path"],
                 )
             self.buffer.compute_returns(last_value, config.ppo.gamma, config.ppo.gae_lambda)
 
@@ -111,6 +114,7 @@ class Runner:
                         "mean_length": self.tracker.mean_length,
                         "success_by_quality": self.tracker.success_by_quality(),
                         "length_by_quality": self.tracker.length_by_quality(),
+                        "termination_by_quality": self.tracker.termination_breakdown(),
                     },
                 )
 

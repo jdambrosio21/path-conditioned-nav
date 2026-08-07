@@ -30,6 +30,11 @@ class EpisodeTracker:
         self.outcomes: dict[int, deque[tuple[float, float]]] = {
             int(q): deque(maxlen=window) for q in PathQuality
         }
+        # Termination reason per condition. "Did not succeed" is not a diagnosis --
+        # colliding and timing out call for opposite fixes, so they are tracked apart.
+        self.terminations: dict[int, deque[str]] = {
+            int(q): deque(maxlen=window) for q in PathQuality
+        }
 
     @torch.no_grad()
     def record(
@@ -46,7 +51,13 @@ class EpisodeTracker:
         self.lengths.extend(episode_length[idx].tolist())
 
         success = info["success"][idx].float()
+        collision = info["collision"][idx].float()
         quality = info["path_quality"][idx]
+        for quality_id, succeeded, collided in zip(
+            quality.tolist(), success.tolist(), collision.tolist(), strict=True
+        ):
+            reason = "success" if succeeded > 0.5 else ("collision" if collided > 0.5 else "timeout")
+            self.terminations[int(quality_id)].append(reason)
         for quality_id, succeeded, length in zip(
             quality.tolist(), success.tolist(), episode_length[idx].tolist(), strict=True
         ):
@@ -75,6 +86,19 @@ class EpisodeTracker:
         for q in PathQuality:
             rows = [length for succeeded, length in self.outcomes[int(q)] if succeeded > 0.5]
             out[q.name] = sum(rows) / len(rows) if rows else float("nan")
+        return out
+
+
+    def termination_breakdown(self) -> dict[str, dict[str, float]]:
+        """Fraction of episodes ending each way, per path-quality condition."""
+        out: dict[str, dict[str, float]] = {}
+        for q in PathQuality:
+            rows = self.terminations[int(q)]
+            total = max(len(rows), 1)
+            out[q.name] = {
+                reason: sum(r == reason for r in rows) / total
+                for reason in ("success", "collision", "timeout")
+            }
         return out
 
 

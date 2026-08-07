@@ -1,12 +1,26 @@
 """Asymmetric actor-critic network.
 
-Asymmetry is the point: the actor is restricted to what a real robot could sense,
-while the critic additionally receives privileged simulator state *and the true
-optimal path* -- even on episodes where the actor was deliberately handed a
-corrupted, misleading, or absent one. This lets the value function score a state
-by how good it genuinely is, rather than by how good the (possibly wrong) path
-makes it look, which is what keeps the advantage signal clean under path
-corruption.
+The actor is restricted to what a real robot could sense. The critic receives
+that **plus** privileged simulator state and the true optimal path.
+
+The word that matters is *plus*. An asymmetric critic must observe a strict
+**superset** of the actor -- extra information, never substituted information.
+Handing the critic the optimal path *instead of* the path the actor actually
+received breaks that, and the failure is subtle: for one underlying state the
+actor's expected return depends heavily on which reference path it was given,
+but a critic that cannot tell those cases apart predicts a single blended value.
+The resulting advantages are biased per condition, and whichever condition the
+policy happens to do best in gets systematically positive advantage, reinforcing
+itself while the others are suppressed.
+
+That is not hypothetical. Trained on a mixture, this codebase reached 0.77
+success on NONE (the one condition the critic could identify, via the has_path
+observation flag) while every path-bearing condition sat near 0.00 -- despite
+each of them learning to >0.95 when trained in isolation.
+
+So the critic encodes both paths: the one the actor saw, and the truth. The
+encoder is shared between them, since they are the same modality; the two
+contexts are distinguished by position in the concatenation.
 """
 
 from __future__ import annotations
@@ -55,7 +69,8 @@ class PathConditionedActorCritic(nn.Module):
             nn.Linear(OBS_DIM + PRIV_DIM, dim), nn.ELU(), nn.Linear(dim, dim)
         )
         self.critic_path_encoder = WaypointEncoder(dim, config.num_heads, config.encoder_layers)
-        self.critic_trunk = _build_mlp(2 * dim, config.trunk_hidden, 1)
+        # state + context(actor's path) + context(true optimal path)
+        self.critic_trunk = _build_mlp(3 * dim, config.trunk_hidden, 1)
 
         # Applied to the actor's proprioceptive/exteroceptive vector only.
         self.obs_dropout = TemporallyConsistentDropout(
@@ -82,12 +97,25 @@ class PathConditionedActorCritic(nn.Module):
         return self.actor_trunk(torch.cat([state, context], dim=-1))
 
     def value(
-        self, obs: torch.Tensor, priv: torch.Tensor, optimal_path: torch.Tensor
+        self,
+        obs: torch.Tensor,
+        priv: torch.Tensor,
+        optimal_path: torch.Tensor,
+        observed_path: torch.Tensor,
     ) -> torch.Tensor:
-        """Value estimate from privileged state and the *true* optimal path."""
+        """Value estimate from privileged state, the actor's path, and the truth.
+
+        `observed_path` is what the actor was given -- possibly corrupted, possibly
+        absent. Without it the critic cannot distinguish an episode where the actor
+        is following good guidance from one where it is being actively misled, and
+        must average over both.
+        """
         state = self.critic_state_encoder(torch.cat([obs, priv], dim=-1))
-        context = self.critic_path_encoder(optimal_path, state)
-        return self.critic_trunk(torch.cat([state, context], dim=-1)).squeeze(-1)
+        observed_context = self.critic_path_encoder(observed_path, state)
+        optimal_context = self.critic_path_encoder(optimal_path, state)
+        return self.critic_trunk(
+            torch.cat([state, observed_context, optimal_context], dim=-1)
+        ).squeeze(-1)
 
     # ------------------------------------------------------------ distribution
 
@@ -113,7 +141,9 @@ class PathConditionedActorCritic(nn.Module):
         return {
             "action": action,
             "log_prob": dist.log_prob(action).sum(-1),
-            "value": self.value(batch["obs"], batch["priv"], batch["opt_path"]),
+            "value": self.value(
+                batch["obs"], batch["priv"], batch["opt_path"], batch["path"]
+            ),
             "mean": dist.mean,
             "std": dist.stddev,
         }
@@ -133,5 +163,5 @@ class PathConditionedActorCritic(nn.Module):
         dist = self.distribution(batch["obs"], batch["path"], batch.get("dropout_mask"))
         log_prob = dist.log_prob(action).sum(-1)
         entropy = dist.entropy().sum(-1)
-        value = self.value(batch["obs"], batch["priv"], batch["opt_path"])
+        value = self.value(batch["obs"], batch["priv"], batch["opt_path"], batch["path"])
         return log_prob, entropy, value, dist.mean, dist.stddev

@@ -86,9 +86,25 @@ def test_critic_uses_privileged_input():
     """Changing privileged state must move the value estimate."""
     policy = PathConditionedActorCritic(PolicyConfig(dropout=0.0), num_envs=8).eval()
     batch = make_batch()
-    baseline = policy.value(batch["obs"], batch["priv"], batch["opt_path"])
-    altered = policy.value(batch["obs"], batch["priv"] + 1.0, batch["opt_path"])
+    baseline = policy.value(batch["obs"], batch["priv"], batch["opt_path"], batch["path"])
+    altered = policy.value(batch["obs"], batch["priv"] + 1.0, batch["opt_path"], batch["path"])
     assert not torch.allclose(baseline, altered, atol=1e-5)
+
+
+def test_critic_distinguishes_episodes_by_the_path_the_actor_saw():
+    """The superset property.
+
+    Two episodes identical in privileged state and true optimal path, differing
+    only in what the actor was handed, must receive different value estimates --
+    otherwise advantages are blended across path conditions and whichever
+    condition the policy does best in crowds out the rest.
+    """
+    policy = PathConditionedActorCritic(PolicyConfig(dropout=0.0), num_envs=8).eval()
+    batch = make_batch()
+    absent = torch.zeros_like(batch["path"])
+    with_path = policy.value(batch["obs"], batch["priv"], batch["opt_path"], batch["path"])
+    without_path = policy.value(batch["obs"], batch["priv"], batch["opt_path"], absent)
+    assert not torch.allclose(with_path, without_path, atol=1e-5)
 
 
 def test_temporally_consistent_dropout_mask_is_stable_between_resamples():

@@ -166,6 +166,11 @@ class PathConditionedNavEnv:
         self.previous_geodesic = zeros(n)
         self.previous_arclength = zeros(n)
 
+        # --- shortcut-reward bookkeeping (episode-cumulative, see step()) ---
+        self.initial_geodesic = zeros(n)
+        self.initial_arclength = zeros(n)
+        self.best_lead = zeros(n)
+
         # Device-side RNG so episode resets never touch the host.
         self.generator = torch.Generator(device=dev)
         self.generator.manual_seed(self.config.seed)
@@ -298,6 +303,9 @@ class PathConditionedNavEnv:
         self.previous_arclength[env_ids] = self._project_onto_path(
             self.reference_path, self.reference_path_len, env_ids
         )[0]
+        self.initial_geodesic[env_ids] = self.previous_geodesic[env_ids]
+        self.initial_arclength[env_ids] = self.previous_arclength[env_ids]
+        self.best_lead[env_ids] = 0.0
 
     # ------------------------------------------------------------- geometry
 
@@ -549,7 +557,6 @@ class PathConditionedNavEnv:
         clearance = self._clearance()
 
         geodesic_progress = (self.previous_geodesic - geodesic).clamp(-5.0, 5.0)
-        arclength_consumed = (arclength - self.previous_arclength).clamp(-5.0, 5.0)
 
         tipped_over = self._extra_failures()
         collided = (clearance < 0.0) | tipped_over
@@ -560,25 +567,55 @@ class PathConditionedNavEnv:
         reward = w.progress * geodesic_progress
         reward = reward + w.time
         reward = reward + w.action_rate * (action - self.previous_action).pow(2).sum(1)
-        reward = reward + w.clearance * (
-            1.0 - (clearance / w.clearance_threshold_m).clamp(0, 1)
-        ).pow(2)
+        clearance_penalty = (1.0 - (clearance / w.clearance_threshold_m).clamp(0, 1)).pow(2)
+        reward = reward + w.clearance * clearance_penalty
 
         # Shortcut reward (the paper's novel term): fires only when the robot gains
         # more true geodesic progress than the reference-path arclength it consumed,
         # i.e. it cut a corner the path did not offer. Zero when there is no path.
+        # Shortcut reward (the paper's novel term): credit for getting *ahead of*
+        # the reference path -- covering more true geodesic distance than the path
+        # arclength consumed to do it.
+        #
+        # Defined on an episode-cumulative running maximum rather than a per-step
+        # delta, and that detail is the whole reward. Any one-sided bonus on a
+        # signed per-step quantity is farmable by oscillation: the gains pay and
+        # the losses are clamped away, so a policy can shuttle back and forth
+        # collecting the positive half forever. Two successive versions of this
+        # term were exploited exactly that way -- first by driving at full reverse
+        # (backing up shortens path arclength faster than it costs geodesic
+        # distance, since a path is always longer than the geodesic), then, after
+        # gating on forward progress, by turning around and oscillating.
+        #
+        # A running maximum telescopes: only genuinely new ground pays, so the
+        # total bonus over an episode can never exceed the lead actually achieved,
+        # no matter how the robot moves in between.
         has_path = self.reference_path_len > 0
-        reward = reward + w.shortcut * torch.where(
-            has_path,
-            (geodesic_progress - arclength_consumed).clamp(min=0.0),
-            torch.zeros_like(geodesic_progress),
+        lead = (self.initial_geodesic - geodesic) - (arclength - self.initial_arclength)
+        shortcut_bonus = torch.where(
+            has_path, (lead - self.best_lead).clamp(min=0.0), torch.zeros_like(lead)
         )
+        self.best_lead = torch.maximum(self.best_lead, lead)
+        reward = reward + w.shortcut * shortcut_bonus
 
         reward = reward + w.goal_bonus * reached_goal.float()
         reward = reward + w.collision * collided.float()
 
         done = collided | reached_goal | timed_out
+        # Individual reward terms are exposed for diagnostics. "It didn't learn" is
+        # one symptom with many causes; seeing which term dominates separates a
+        # broken objective from a broken policy in one measurement.
         info = {
+            "reward_terms": {
+                "progress": w.progress * geodesic_progress,
+                "shortcut": w.shortcut * shortcut_bonus,
+                "clearance": w.clearance * clearance_penalty,
+                "action_rate": w.action_rate * (action - self.previous_action).pow(2).sum(1),
+                "time": torch.full_like(reward, w.time),
+                "goal": w.goal_bonus * reached_goal.float(),
+                "collision": w.collision * collided.float(),
+            },
+            "forward_speed": self.forward_speed.clone(),
             "success": reached_goal,
             "collision": collided,
             "tipped_over": tipped_over,

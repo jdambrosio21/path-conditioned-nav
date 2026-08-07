@@ -122,8 +122,83 @@ def test_shortcut_reward_requires_a_reference_path():
     env = make_env(num_envs=16, seed=17, quality="NONE")
     action = torch.zeros(env.num_envs, 2)
     action[:, 0] = 1.0
-    _, reward, _, _ = env.step(action)
+    _, reward, _, info = env.step(action)
     assert torch.isfinite(reward).all()
+    assert torch.all(info["reward_terms"]["shortcut"] == 0.0)
+
+
+def test_shortcut_reward_never_pays_for_retreating():
+    """Regression guard for a reward-hacking exploit.
+
+    Backing away from the goal shortens the reference-path arclength faster than
+    it costs geodesic distance, because a path is always longer than the geodesic.
+    An unguarded `(d_geo - d_s).clamp(min=0)` therefore pays out for retreating,
+    and the policy learns to drive at full reverse whenever a path is present.
+    """
+    env = make_env(num_envs=64, seed=29, quality="OPTIMAL")
+    weights = env.config.reward
+    reverse = torch.zeros(env.num_envs, 2)
+    reverse[:, 0] = -1.0
+    for _ in range(15):
+        _, _, _, info = env.step(reverse)
+        progress = info["reward_terms"]["progress"] / weights.progress
+        bonus = info["reward_terms"]["shortcut"] / weights.shortcut
+        # The invariant is conditional: some environments start facing sideways to
+        # the goal, so reversing can still close distance. What must never happen
+        # is a payout while losing ground.
+        assert torch.all(bonus[progress <= 0.0] <= 1e-6)
+
+
+def test_shortcut_reward_cannot_be_farmed_by_oscillating():
+    """The core anti-exploit property.
+
+    A policy that drives forward and back repeatedly must collect the shortcut
+    bonus at most once, not once per cycle. A per-step one-sided bonus fails this;
+    a running maximum passes it.
+    """
+    env = make_env(num_envs=32, seed=31, quality="SUBOPTIMAL")
+    weights = env.config.reward
+    # Forward and reverse limits differ 4x, so the actions are chosen to give equal
+    # speed (0.5 m/s each way). Otherwise the "oscillation" ratchets steadily
+    # forward and legitimately earns new credit every cycle.
+    forward = torch.zeros(env.num_envs, 2)
+    forward[:, 0] = 0.25
+    backward = torch.zeros(env.num_envs, 2)
+    backward[:, 0] = -1.0
+
+    # An episode that terminates mid-test resets the bookkeeping, so only
+    # environments that survive the whole sequence can be accounted.
+    alive = torch.ones(env.num_envs, dtype=torch.bool)
+    collected = torch.zeros(env.num_envs)
+    first_cycle = torch.zeros(env.num_envs)
+    for cycle in range(6):
+        for action in (forward, backward):
+            for _ in range(4):
+                _, _, done, info = env.step(action)
+                collected += (info["reward_terms"]["shortcut"] / weights.shortcut) * alive
+                alive &= ~done
+        if cycle == 0:
+            first_cycle = collected.clone()
+
+    assert bool(alive.any()), "no environment survived the oscillation test"
+    # Later cycles revisit ground already credited, so they must add ~nothing.
+    assert torch.all(collected[alive] <= first_cycle[alive] + 1e-3)
+
+
+def test_shortcut_bonus_is_bounded_by_the_lead_achieved():
+    """Total credit over an episode cannot exceed the lead over the path."""
+    env = make_env(num_envs=64, seed=37, quality="SUBOPTIMAL")
+    weights = env.config.reward
+    forward = torch.zeros(env.num_envs, 2)
+    forward[:, 0] = 1.0
+    alive = torch.ones(env.num_envs, dtype=torch.bool)
+    total = torch.zeros(env.num_envs)
+    for _ in range(20):
+        _, _, done, info = env.step(forward)
+        total += (info["reward_terms"]["shortcut"] / weights.shortcut) * alive
+        alive &= ~done
+    assert bool(alive.any())
+    assert torch.all(total[alive] <= env.best_lead[alive].clamp(min=0.0) + 1e-3)
 
 
 def test_episode_terminates_and_auto_resets():
