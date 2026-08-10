@@ -206,12 +206,12 @@ def test_matches_2d_raycaster_on_horizontal_rays():
     # Arenas without trap structures: the 3-D routine under test handles cylinders,
     # so comparing against a scan that also sees oriented-box walls would be
     # measuring the missing primitive rather than the geometry. Ray-OBB support in
-    # the depth module is still outstanding -- see docs/analytic-depth.md.
+    # the depth module is still outstanding.
     env = PathConditionedNavEnv(
         EnvConfig(
             num_envs=8, device="cpu", seed=5,
             # Maze walls are oriented boxes, which the depth module does not yet
-            # cast against -- see docs/analytic-depth.md 6b.
+            # cast against.
             maps=MapConfig(num_maps=3, use_maze=False, num_structures=(0, 1)),
         )
     )
