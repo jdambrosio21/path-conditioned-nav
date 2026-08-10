@@ -1,156 +1,118 @@
 # Path-Conditioned RL Local Planning — Wheeled Robot, Apple Silicon
 
-A reimplementation of **"Path-conditioned Reinforcement Learning-based Local Planning
-for Long-Range Navigation"** (Haro, Richter, Yang, Cadena, Hutter — [arXiv:2603.13888](https://arxiv.org/abs/2603.13888)),
-retargeted from an Isaac Sim / quadruped setup to a **wheeled robot that trains on an M3 Max**.
+A reproduction of **"Path-conditioned Reinforcement Learning-based Local Planning for
+Long-Range Navigation"** (Haro, Richter, Yang, Cadena, Hutter — [arXiv:2603.13888](https://arxiv.org/abs/2603.13888)),
+retargeted from an Isaac Sim / quadruped setup to a **wheeled robot trained end-to-end
+on an M3 Max**.
 
-The paper's claim, in one sentence: *give a navigation policy a reference path as an
+The paper's claim in one sentence: *give a navigation policy a reference path as an
 **observation** rather than something it is rewarded for following, and it learns to
-exploit good paths while staying robust to misleading ones.* That claim, and the
-machinery behind it, is what this repository reproduces.
+exploit good paths while staying robust to misleading ones.*
+
+---
+
+## Result
+
+Deterministic evaluation, held-out maps, 200 episodes per condition. Baseline is the
+same architecture trained **without ever seeing a path** (0.44 uniformly).
+
+| condition | success | efficiency |
+|---|---|---|
+| `OPTIMAL` | **0.99** | **1.12** |
+| `NOISY` | 0.99 | 1.14 |
+| `SUBOPTIMAL` | 0.98 | 1.22 |
+| `DETOURED` | 0.98 | 1.38 |
+| `WRONG_GOAL` | **0.24** | 1.50 |
+| `NONE` | 0.43 | 1.86 |
+
+**Reproduced:** path exploitation (0.43 → 0.99), and the paper's predicted signature —
+success flat across `OPTIMAL → DETOURED` while efficiency degrades monotonically. A
+tracker's success would collapse; a path-ignorer's efficiency would be flat.
+
+**Did not reproduce:** `WRONG_GOAL` robustness. Handed a well-formed route to the wrong
+place, the policy follows it (0.24, *below* the no-path baseline). Likely structural —
+the policy sees 15 m of path against 60 m routes, so a wrong-goal path is locally
+indistinguishable from a correct one.
+
+**Sim-to-sim:** the policy transfers to MuJoCo rigid-body physics at 0.97 on `OPTIMAL`,
+ordering preserved. Not an experiment in the paper.
+
+Full numbers, including benchmark-validity checks and throughput: **[`docs/results.md`](docs/results.md)**.
 
 ---
 
 ## Why this is not a line-by-line port
 
-The paper trains in **Isaac Sim / Isaac Lab** on an **RTX 4090** (39.5 h), with a
-Unitree B2W consuming **40×64 depth images** from 1046 parallel environments. None of
-that runs on Apple Silicon:
+The paper trains in **Isaac Sim / Isaac Lab** on an **RTX 4090** (39.5 h), with a Unitree
+B2W consuming **40×64 depth images**. None of that runs on Apple Silicon: Isaac is
+CUDA + Linux/Windows only, and MJX has **no batched renderer** (`madrona-mjx` is
+CUDA-only). So the substrate was swapped and the contribution kept.
 
-- Isaac Sim/Lab is CUDA + Linux/Windows only.
-- MJX has **no batched renderer**; `madrona-mjx` is CUDA-only. Batched depth imagery
-  is unavailable on this hardware at any batch size, on any backend.
-
-So the substrate was swapped and the contribution kept.
-
-| | Paper | This repo | Rationale |
-|---|---|---|---|
-| Simulator (training) | Isaac Sim / Isaac Lab | Vectorized PyTorch env | Isaac is CUDA-only |
-| Simulator (eval/viz) | — | **MuJoCo** | Real contact physics + viewer |
-| Robot | Unitree B2W (wheeled quadruped) | Wheeled skid-steer base | Requested platform |
-| Action | `(v_x, v_y, ω)` @ 5 Hz | `(v_x, ω)` @ 5 Hz | Wheeled base cannot strafe |
-| Perception | 40×64 depth, 105° FOV, 10 m | 64-ray scan, **105° FOV, 10 m** | No batched renderer on Mac |
-| Path generation | PRM + A\*, biased GBFS, ±1 m noise | **same** | Core method |
-| Path encoder | self-attn → cross-attn, 15 waypoints | **same** | Core method |
-| Reward | goal-reaching + shortcut, **no path-following term** | **same** | Core claim |
-| Learning | asymmetric-critic PPO (rsl-rl) | asymmetric-critic PPO | Core method |
-
-**Deviations worth knowing about**, beyond the table:
-
-- `DETOURED` reference paths are "a biased-GBFS route made worse by a smooth
-  displacement" rather than "a route forced through a random via point". Both yield a
-  plausible route that wastes distance, which is what the condition tests.
-- Our path encoder is ~50 k parameters against the paper's 12,960. Our observation is
-  74-D rather than their 2636-D flattened depth map, so absolute parameter counts are
-  not directly comparable.
-- The shortcut reward's exact functional form is not recoverable from the paper. Ours
-  fires when the robot gains **more true geodesic progress than the reference-path
-  arclength it consumed** — i.e. it cut a corner the path did not offer. See
-  `RewardConfig` and `torch_env.step`.
-
----
-
-## Why the physics runs on the CPU and the network on the GPU
-
-The obvious plan on a 30-GPU-core M3 Max is "MJX on Metal". Measured on this machine,
-that is the wrong plan:
-
-| Physics backend | Throughput |
-|---|---|
-| **C MuJoCo, `mujoco.rollout`, 14 threads** | **3,480,000 steps/s** |
-| C MuJoCo, single thread | 107,000 steps/s |
-| MJX on `jax-mps` Metal backend (B=32768, async dispatch) | 47,800 steps/s |
-| MJX on JAX CPU backend (B=2048) | 14,700 steps/s |
-
-MJX-on-Metal plateaus from B=4096 onward — **dispatch-bound, not compute-bound**. A
-MuJoCo step is hundreds of tiny branchy kernels; XLA:CUDA fuses them, while the
-community `jax-mps` PJRT plugin lowers op-by-op onto MPSGraph. (Apple's official
-`jax-metal` has been unmaintained since October 2024.)
-
-The GPU itself is fine — it just wants big kernels:
-
-| Workload | CPU | Metal |
+| | paper | this repo |
 |---|---|---|
-| 4096³ matmul | 1.00 TFLOP/s | **8.24 TFLOP/s** |
-| PPO epoch pass, paper-sized actor | 1908 ms | **254 ms** |
+| Simulator (training) | Isaac Sim / Isaac Lab | vectorized PyTorch env |
+| Simulator (eval/viz) | — | **MuJoCo** |
+| Robot | Unitree B2W (wheeled quadruped) | differential-drive base |
+| Action | `(v_x, v_y, ω)` @ 5 Hz | `(v_x, ω)` @ 5 Hz — cannot strafe |
+| Perception | 40×64 depth, pretrained CNN | 64-ray scan, **same** 105° FOV / 10 m |
+| Memory | SRU (Yang et al. 2025) | **same** (SRU-GRU variant) |
+| Path generation | PRM + A\*, biased GBFS, ±1 m noise | **same**, smooth 0.4 m noise |
+| Path encoder | self-attn → cross-attn, 15 waypoints | **same** |
+| Reward | goal-reaching + shortcut, **no path-following term** | **same** |
+| Learning | asymmetric-critic PPO (rsl-rl) | **same** |
+| Base policy | Yang et al. 2025, pretrained on synthetic depth | our own path-free navigator |
+| Environment | procedural mazes, 30 m train / 50 m eval | procedural mazes, 45 m |
 
-Hence the split: **closed-form dynamics + ray casting batched on the GPU**, gradients
-on the GPU, and MuJoCo reserved for evaluation and visualization where its fidelity
-earns its cost.
+**Guesses forced by the paper**, which does not publish them: the path-quality mixture
+(30/25/20/10/5/10), the shortcut reward's functional form, and the exact SRU variant.
+
+**Deliberate deviations, with reasons.** Perturbation is smooth 0.4 m rather than IID
+1 m, because 1 m puts a path through walls in a 2.8 m corridor. Training is at 45 m
+rather than 30 m, because a path-blind policy solved 30 m mazes at 0.97 — leaving
+nothing to measure. **Deep Mutual Learning is not implemented.**
 
 ---
 
-## Install
+## Why physics runs on the CPU and the network on the GPU
+
+The obvious plan on a 30-GPU-core M3 Max is "MJX on Metal". Measured, that is the wrong
+plan:
+
+| physics backend | steps/s |
+|---|---|
+| **C MuJoCo, `mujoco.rollout`, 14 threads** | **3,480,000** |
+| C MuJoCo, single thread | 107,000 |
+| MJX on `jax-mps` Metal (B=32768, async) | 47,800 |
+| MJX on JAX CPU (B=2048) | 14,700 |
+
+MJX-on-Metal plateaus from B=4096 — **dispatch-bound, not compute-bound**. A MuJoCo step
+is hundreds of tiny branchy kernels; XLA:CUDA fuses them, while the community `jax-mps`
+PJRT plugin lowers op-by-op onto MPSGraph. (Apple's official `jax-metal` has been
+unmaintained since October 2024.)
+
+The GPU is fine — it wants big kernels: **8.24 TFLOP/s** on a 4096³ matmul against 1.00
+on CPU. Hence closed-form dynamics and ray casting batched on the GPU, gradients on the
+GPU, and MuJoCo reserved for evaluation where its fidelity earns its cost.
+
+---
+
+## Install and use
 
 ```bash
-git clone <this repo> && cd path-conditioned-nav
-uv sync
-```
+uv sync                                    # Python >=3.11; uv handles the rest
 
-Requires Python ≥3.11. `uv` handles everything else (torch, numpy, scipy, mujoco).
+# Two-stage training, as the paper does (it warm-starts from a pretrained navigator)
+uv run scripts/train.py --num-envs 4096 --num-maps 80 --iterations 500 \
+    --fixed-quality NONE --run-name base           # stage 1: path-free navigator
+uv run scripts/train.py --num-envs 4096 --num-maps 80 --iterations 700 \
+    --init-from runs/base/policy_final.pt --run-name mixture   # stage 2: path mixture
 
-## Usage
+uv run scripts/evaluate.py runs/mixture/policy_final.pt            # ablation table
+uv run scripts/evaluate.py runs/mixture/policy_final.pt --mujoco   # + sim-to-sim
+uv run scripts/visualize.py runs/mixture/policy_final.pt --quality SUBOPTIMAL
 
-```bash
-# Train (full run: 4096 envs, 180 arenas)
-uv run scripts/train.py --num-envs 4096 --num-maps 180 --iterations 3000
-
-# Quick local check
-uv run scripts/train.py --num-envs 256 --num-maps 8 --iterations 20 --device cpu
-
-# Evaluate across all reference-path conditions, on held-out maps
-uv run scripts/evaluate.py runs/main/policy_final.pt
-
-# ...and re-run the sweep under real MuJoCo physics (sim-to-sim)
-uv run scripts/evaluate.py runs/main/policy_final.pt --mujoco
-
-# Watch it drive
-uv run scripts/visualize.py runs/main/policy_final.pt --quality SUBOPTIMAL
-
-# Tests
+uv run python tools/render_map.py     # look at an arena before trusting it
 uv run pytest
-```
-
----
-
-## The experiment
-
-`scripts/evaluate.py` sweeps the reference-path condition and reports success rate and
-path efficiency for each:
-
-| Condition | Reference path the policy is handed |
-|---|---|
-| `OPTIMAL` | A\* route on the PRM |
-| `NOISY` | optimal + smooth displacement ≤ 1 m |
-| `SUBOPTIMAL` | biased-GBFS route — plausible but wasteful |
-| `DETOURED` | suboptimal + displacement ≤ 2 m |
-| `WRONG_GOAL` | a well-formed route to a *different* goal |
-| `NONE` | no path at all |
-
-The paper's claim predicts a specific signature: **success rate stays roughly flat
-across conditions** (the policy never becomes dependent on guidance) while
-**efficiency improves when guidance is good**. A policy satisfying only the first has
-learned to ignore the path; only the second, to follow it blindly.
-
-**Environment validation.** Before any learning, a scripted pure-pursuit controller
-(no obstacle avoidance, ignores the scan entirely) already shows the intended ordering,
-confirming the reward and path machinery are wired correctly:
-
-| Condition | Success |
-|---|---|
-| `OPTIMAL` | 67.9% |
-| `SUBOPTIMAL` | 47.8% |
-| `WRONG_GOAL` | 21.3% |
-| `NONE` | 21.4% |
-
-## Measured training throughput
-
-M3 Max (14 CPU / 30 GPU cores, 36 GB), 2048 envs, MPS backend:
-
-```
-rollout   1.52 s     (env.step 0.62 s, policy.act 0.83 s)
-update    7.02 s
-total     8.54 s/iteration  ->  5,755 env-steps/s
 ```
 
 ---
@@ -160,40 +122,96 @@ total     8.54 s/iteration  ->  5,755 env-steps/s
 ```
 src/pcnav/
   config.py            all tunables; one ExperimentConfig fully describes a run
-  maps.py              procedural arenas, inflated occupancy, geodesic fields
+  maps.py              procedural mazes, inflated occupancy, geodesic fields
   planning.py          PRM, A*, biased GBFS, path resampling and corruption
   path_library.py      precomputed route tables (cached) so resets stay on-GPU
   envs/
     torch_env.py       batched env: dynamics, ray casting, rewards, resets
     mujoco_env.py      same logic, real physics — evaluation and visualization
   models/
+    recurrent.py       Spatially-Enhanced Recurrent Unit (Yang et al. 2025)
     path_encoder.py    waypoint self-attn -> cross-attn; temporally consistent dropout
-    actor_critic.py    asymmetric actor-critic
+    actor_critic.py    recurrent asymmetric actor-critic
   algorithms/
-    ppo.py             clipped PPO, value clipping, KL-adaptive LR
+    ppo.py             clipped PPO, sequence minibatching, KL-adaptive LR
     runner.py          rollout / update / logging / checkpoint loop
   sim/
-    mjcf.py            MapData -> MJCF scene, skid-steer inverse kinematics
+    mjcf.py            MapData -> MJCF scene, differential-drive kinematics
+    depth.py           analytic depth rendering, no renderer required
     viewer.py          passive viewer with path + goal markers, offscreen render
-  utils/               metric tracking, logging, seeding
 scripts/               train.py, evaluate.py, visualize.py
-tests/                 27 tests over maps, env geometry, rewards, models
+tools/                 diagnostics -- see tools/README.md
+tests/                 68 tests over maps, geometry, rewards, models, recurrence
+docs/                  see below
 ```
 
-### Two implementation details that are easy to get wrong
+## Documentation
 
-1. **Attention masking.** 10% of training episodes have *no* reference path, so every
-   waypoint is masked. Attention over a fully-masked sequence yields NaNs; those rows
-   get a dummy attendable slot and their output is forced to exact zero. That clean
-   zero is the "no guidance available" signal.
+| doc | what it covers |
+|---|---|
+| [`docs/results.md`](docs/results.md) | full numbers, benchmark validity, throughput |
+| [`docs/paper-walkthrough.md`](docs/paper-walkthrough.md) | the paper end to end, and how it maps onto this code |
+| [`docs/reading-guide.md`](docs/reading-guide.md) | how to read this codebase for the *engineering*, with break-it exercises |
+| [`docs/analytic-depth.md`](docs/analytic-depth.md) | batched depth images with no renderer — design and derivations |
 
-2. **Dropout must be replayable.** Any dropout that redraws its mask per forward pass
-   means a PPO update re-scores actions through a *different* network than produced
-   them, silently corrupting the importance ratio. All stochastic regularization lives
-   in `TemporallyConsistentDropout`, whose mask is recorded in the rollout buffer and
-   replayed at update time — which also matches the paper's named regularizer. There is
-   deliberately no dropout inside the attention stack. (`tests/test_models.py` guards
-   this.)
+---
+
+## Reading list
+
+Ordered by marginal value to someone who already knows PPO and RL. Each entry connects
+to something that actually went wrong here.
+
+**1. Ng, Harada & Russell (1999), _Policy Invariance Under Reward Transformations_.**
+The theory behind the worst bug in this project. The shortcut reward was farmable by
+oscillation — the policy drove backwards to collect it — and the fix (a non-decreasing
+running maximum) works for reasons this paper makes precise. Potential-based shaping is
+*provably* policy-invariant and *provably* unfarmable. Read it and "is this shaping term
+telescoping?" becomes reflex.
+
+**2. Yang et al. (2025), _Spatially-Enhanced Recurrent Memory_ ([arXiv:2506.05997](https://arxiv.org/abs/2506.05997)).**
+The SRU implemented in `models/recurrent.py`, and the base navigator this paper builds
+on. Short. Their spatial-memorization benchmark design is as instructive as the
+architecture.
+
+**3. Jayakumar et al. (ICLR 2020), _Multiplicative Interactions and Where to Find Them_.**
+The *why* behind the SRU, generalized: a formal account of what multiplicative
+interactions buy that additive layers cannot cheaply reach. Pair with **FiLM** (Perez et
+al. 2018). Together they turn "a GRU with one extra multiplicative term" from a trick
+into an instance of a principle.
+
+**4. Kapturowski et al. (ICLR 2019), _R2D2_.** The definitive treatment of hidden state
+in RL — stored states, burn-in, staleness. This codebase hit the update-vs-collection
+consistency hazard three times (dropout mask, KL estimator, recurrent replay); this is
+where the field worked it out properly.
+
+**5. Teacher–student privileged distillation.** The natural next project. The asymmetric
+critic here uses privileged information, but **this repo does not do distillation** —
+that would mean training a privileged teacher and transferring it into a sensor-limited
+student. Start with _Learning by Cheating_ (Chen et al. 2019); then Lee et al. (2020) and
+Miki et al. (2022), both *Science Robotics*, both from this same lab.
+
+**6. Domain randomization** (Tobin et al. 2017; Peng et al. 2018). The sim-to-sim result
+here is a weak version of this question, and the paper uses domain randomization
+*instead of* a curriculum.
+
+**Skip**, given that background: transformer/attention fundamentals (the path encoder is
+a two-layer attention block) and A\* theory (nothing difficult lived there).
+
+---
+
+## Two implementation details that are easy to get wrong
+
+**Update-time behaviour must match collection-time behaviour.** PPO's importance ratio
+assumes stored actions are re-scored under the *same* network that produced them. Three
+separate violations occurred here — an unrecorded dropout mask, dropout inside the
+attention stack, and recurrent replay from the wrong hidden state. None raised an error;
+each silently corrupted the gradient. `tests/test_recurrent.py` pins the last one
+bit-for-bit.
+
+**Cross-component assumptions drift silently.** The MuJoCo robot had a 0.569 m envelope
+while maps, roadmap and collision all modelled a 0.350 m disc. Invisible while a control
+bug prevented the robot from turning, and instantly fatal once that was fixed — a masked
+bug can look like a working system. `tests/test_env.py` now pins the two together.
 
 ## Citation
 
@@ -203,5 +221,11 @@ tests/                 27 tests over maps, env geometry, rewards, models
   author = {Haro, Mateo and Richter, Julia and Yang, Fan and Cadena, Cesar and Hutter, Marco},
   journal = {arXiv preprint arXiv:2603.13888},
   year   = {2026}
+}
+@article{yang2025spatially,
+  title  = {Spatially-Enhanced Recurrent Memory for Long-Range Mapless Navigation via End-to-End Reinforcement Learning},
+  author = {Yang, Fan and Frivik, Per and Hoeller, David and Wang, Chen and Cadena, Cesar and Hutter, Marco},
+  journal = {The International Journal of Robotics Research},
+  year   = {2025}
 }
 ```

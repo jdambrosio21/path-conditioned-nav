@@ -249,6 +249,18 @@ get both, and it is the absence of the path-following reward that buys it.**
 
 ---
 
+## 6b. What actually reproduced
+
+See [`results.md`](results.md) for the numbers. In summary: path exploitation and the
+flat-success / ordered-efficiency signature both reproduced clearly. Robustness to an
+*actively misleading* path did not -- `WRONG_GOAL` scored 0.24 against a 0.43 path-free
+baseline, meaning the policy follows the lie.
+
+The likely reason is worth carrying into any reimplementation: the policy observes 15
+waypoints at 1 m spacing, i.e. **15 m of a 60 m route**. The first 15 m of a wrong-goal
+path look exactly like a correct one, so the information needed to reject it may never
+enter the observation at all. That is an architecture question, not a training one.
+
 ## 7. The three ideas worth stealing
 
 Independent of this paper, these generalize:

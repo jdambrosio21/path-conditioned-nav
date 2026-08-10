@@ -7,6 +7,13 @@ on tensors.
 This is the thing MJX cannot do on this machine (no batched renderer; `madrona-mjx` is
 CUDA-only). We sidestep it rather than fight it.
 
+**Status:** camera model, ray-cylinder geometry, ground plane, arena walls, broad-phase
+culling and ray chunking are implemented in `src/pcnav/sim/depth.py` and covered by
+`tests/test_depth.py` (validated three ways: hand-computed single rays, agreement with
+the existing 2-D caster on horizontal rays, and invariance to chunking). Not yet done:
+ray-oriented-box for maze walls (§6b), the pits terrain, and the CNN encoder — so depth
+is not yet wired into training.
+
 ---
 
 ## 1. The core idea

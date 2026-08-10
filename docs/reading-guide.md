@@ -171,7 +171,31 @@ scripted pure-pursuit controller checked the whole environment *before any train
 Structuring work so you always have something to check against is most of what separates
 a result from a plausible-looking bug.
 
-**10. Budget memory before writing code.**
+**10. A benchmark can measure nothing, and look fine.**
+Three successive environments were solved at 0.97 by a policy that never saw a path.
+Each passed a scripted-baseline check first -- a hand-written greedy controller scored
+0.4% on the same maps -- because a *learned* policy with a laser scan is far stronger
+than a scripted one. **Validate difficulty against the strongest baseline you have,
+not the most convenient.** The real check is thirty minutes: train a policy without
+the feature, evaluate deterministically, and require that it fails.
+
+**11. Training curves understate policies.**
+The maze run logged 0.60 while deterministic evaluation of that same checkpoint gave
+0.97 -- exploration noise colliding in narrow corridors. Several "it is stalling"
+readings were wrong by 35 points. Judge by evaluation, not the curve.
+
+**12. Cross-component assumptions drift silently.**
+The MuJoCo robot had a 0.569 m envelope while maps, roadmap and collision all modelled
+a 0.350 m disc. It physically could not fit through gaps the planner called clear. Any
+constant shared across module boundaries deserves a test that pins the two together.
+
+**13. A masked bug can look like a working system.**
+That geometry error was invisible while a *separate* control bug stopped the robot from
+turning -- a crawling robot never notices it is too wide. Fixing the controller took
+collisions from 71% to 100%, which reads as a regression and is actually progress.
+When a fix makes things worse, suspect it unmasked something.
+
+**14. Budget memory before writing code.**
 `(envs × rays × obstacles)` — compute it first. It tells you the design (cull + chunk)
 before you've written anything. See `docs/analytic-depth.md` §4.
 
