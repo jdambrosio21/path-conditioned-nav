@@ -37,8 +37,6 @@ indistinguishable from a correct one.
 **Sim-to-sim:** the policy transfers to MuJoCo rigid-body physics at 0.97 on `OPTIMAL`,
 ordering preserved. Not an experiment in the paper.
 
-Full numbers, including benchmark-validity checks and throughput: **[`docs/results.md`](docs/results.md)**.
-
 ---
 
 ## Why this is not a line-by-line port
@@ -142,17 +140,7 @@ src/pcnav/
 scripts/               train.py, evaluate.py, visualize.py
 tools/                 diagnostics -- see tools/README.md
 tests/                 68 tests over maps, geometry, rewards, models, recurrence
-docs/                  see below
 ```
-
-## Documentation
-
-| doc | what it covers |
-|---|---|
-| [`docs/results.md`](docs/results.md) | full numbers, benchmark validity, throughput |
-| [`docs/paper-walkthrough.md`](docs/paper-walkthrough.md) | the paper end to end, and how it maps onto this code |
-| [`docs/reading-guide.md`](docs/reading-guide.md) | how to read this codebase for the *engineering*, with break-it exercises |
-| [`docs/analytic-depth.md`](docs/analytic-depth.md) | batched depth images with no renderer — design and derivations |
 
 ---
 

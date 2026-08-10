@@ -8,7 +8,6 @@ intersection in closed form. Every primitive here — vertical cylinder, ground
 plane, arena wall — has an analytic solution, so the whole image is a handful of
 large fused tensor ops. That is precisely the kernel shape Metal runs well.
 
-See `docs/analytic-depth.md` for the derivations and the memory budget.
 
 Frame conventions
 -----------------
