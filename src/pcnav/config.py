@@ -68,7 +68,24 @@ EPISODE_DURATION_S = 90.0
 MAX_EPISODE_STEPS = int(EPISODE_DURATION_S * NAV_POLICY_HZ)
 
 # Derived tensor dimensions.
-OBS_DIM = NUM_RAYS + 5 + 4 + 1   # scan + goal encoding + proprioception + has_path
+#
+# The +3 is the reference path's *endpoint* in the body frame plus the remaining
+# path length. Without it the policy observes only a 15 m sliding window of a
+# ~60 m route, so the first stretch of a path leading to the wrong goal is
+# indistinguishable from a correct one -- and measured behaviour matched that:
+# WRONG_GOAL scored 0.24, *below* the 0.43 path-free baseline, meaning the policy
+# followed the lie. The endpoint is legitimately observable: a real robot is handed
+# the whole plan, and already observes its own goal, so it can compare them.
+OBS_DIM = NUM_RAYS + 5 + 4 + 1 + 3
+
+# Named offsets into the actor observation. Consumers previously indexed the
+# has_path flag as obs[:, -1], which silently became the wrong channel the moment
+# anything was appended after it.
+SCAN_SLICE = slice(0, NUM_RAYS)
+GOAL_SLICE = slice(NUM_RAYS, NUM_RAYS + 5)
+PROPRIO_SLICE = slice(NUM_RAYS + 5, NUM_RAYS + 9)
+HAS_PATH_INDEX = NUM_RAYS + 9
+PATH_ENDPOINT_SLICE = slice(NUM_RAYS + 10, NUM_RAYS + 13)
 PRIV_DIM = 4                     # critic-only scalars
 ACTION_DIM = 2                   # (forward velocity, yaw rate)
 WAYPOINT_FEATURES = 3            # (x_body, y_body, valid)

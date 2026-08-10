@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from pcnav.config import (
+    HAS_PATH_INDEX,
     NUM_RAYS,
     NUM_WAYPOINTS,
     OBS_DIM,
@@ -83,8 +84,7 @@ def test_no_path_condition_zeroes_the_waypoints():
     obs = env.observe()
     assert torch.all(obs["path"] == 0.0)
     assert torch.all(env.reference_path_len == 0)
-    # The has_path flag is the final observation channel.
-    assert torch.all(obs["obs"][:, -1] == 0.0)
+    assert torch.all(obs["obs"][:, HAS_PATH_INDEX] == 0.0)
 
 
 def test_optimal_condition_supplies_valid_waypoints():
@@ -92,7 +92,7 @@ def test_optimal_condition_supplies_valid_waypoints():
     obs = env.observe()
     assert torch.all(env.reference_path_len > 0)
     assert obs["path"][..., 2].sum() > 0
-    assert torch.all(obs["obs"][:, -1] == 1.0)
+    assert torch.all(obs["obs"][:, HAS_PATH_INDEX] == 1.0)
 
 
 def test_critic_always_receives_the_optimal_path_even_when_actor_does_not():
@@ -237,3 +237,39 @@ def test_mujoco_robot_fits_inside_the_planning_radius():
         f"MuJoCo robot ({robot_footprint_radius():.3f} m) exceeds the planning "
         f"radius ({ROBOT_RADIUS_M:.3f} m)"
     )
+
+
+def test_path_endpoint_observation_exposes_a_wrong_goal():
+    """The cue the policy previously could not see.
+
+    With only a 15 m waypoint window on a ~60 m route, a path to the wrong goal is
+    locally identical to a correct one, and the policy followed it -- WRONG_GOAL
+    scored 0.24 against a 0.43 path-free baseline. The path terminus makes the
+    discrimination possible, since the goal itself is already observed.
+    """
+    from pcnav.config import PATH_ENDPOINT_SLICE
+
+    def endpoint_to_goal(quality: str) -> float:
+        env = make_env(num_envs=96, seed=3, quality=quality)
+        obs = env.observe()["obs"]
+        endpoint_body = obs[:, PATH_ENDPOINT_SLICE][:, :2] * env.arena_size
+        relative = env.goal_position - env.position
+        cos_h, sin_h = torch.cos(-env.heading), torch.sin(-env.heading)
+        goal_body = torch.stack(
+            [
+                relative[:, 0] * cos_h - relative[:, 1] * sin_h,
+                relative[:, 0] * sin_h + relative[:, 1] * cos_h,
+            ],
+            dim=1,
+        )
+        return float((endpoint_body - goal_body).norm(dim=1).median())
+
+    assert endpoint_to_goal("OPTIMAL") < 2.0
+    assert endpoint_to_goal("WRONG_GOAL") > 10.0
+
+
+def test_path_endpoint_features_are_zero_without_a_path():
+    from pcnav.config import PATH_ENDPOINT_SLICE
+
+    env = make_env(num_envs=32, seed=5, quality="NONE")
+    assert torch.all(env.observe()["obs"][:, PATH_ENDPOINT_SLICE] == 0.0)

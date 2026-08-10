@@ -510,6 +510,38 @@ class PathConditionedNavEnv:
 
     # ------------------------------------------------------------ observation
 
+    def _path_endpoint_features(self, vertex: torch.Tensor) -> torch.Tensor:
+        """Where the reference path *ends*, in the body frame, plus how much is left.
+
+        The waypoint window only ever shows the next 15 m. On a 60 m route that is
+        roughly a fifth of the path, and the near portion of a route to the wrong
+        goal looks exactly like the near portion of a correct one -- so the cue
+        needed to reject it never reaches the policy. Exposing the terminus makes
+        the comparison possible, since the goal is already observed.
+        """
+        has_path = (self.reference_path_len > 0).float()
+        last_index = (self.reference_path_len - 1).clamp(min=0)
+        endpoint = torch.gather(
+            self.reference_path, 1, last_index[:, None, None].expand(-1, 1, 2)
+        ).squeeze(1)
+
+        relative = endpoint - self.position
+        cos_h, sin_h = torch.cos(-self.heading), torch.sin(-self.heading)
+        body_x = relative[:, 0] * cos_h - relative[:, 1] * sin_h
+        body_y = relative[:, 0] * sin_h + relative[:, 1] * cos_h
+
+        remaining = (self.reference_path_len.float() - vertex.float()) * PATH_VERTEX_SPACING_M
+
+        features = torch.stack(
+            [
+                (body_x / self.arena_size).clamp(-2, 2),
+                (body_y / self.arena_size).clamp(-2, 2),
+                (remaining / self.arena_size).clamp(0, 4),
+            ],
+            dim=1,
+        )
+        return features * has_path[:, None]
+
     def _build_observation(self) -> dict[str, torch.Tensor]:
         scan = self._cast_rays()
         _, ref_vertex = self._project_onto_path(self.reference_path, self.reference_path_len)
@@ -542,6 +574,7 @@ class PathConditionedNavEnv:
                 ),
                 self.previous_action,
                 (self.reference_path_len > 0).float()[:, None],
+                self._path_endpoint_features(ref_vertex),
             ],
             dim=1,
         )
