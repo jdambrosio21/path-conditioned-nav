@@ -220,3 +220,20 @@ def test_path_quality_mixture_covers_all_conditions():
     env = make_env(num_envs=2048, seed=23)
     seen = set(env.path_quality.tolist())
     assert seen == {int(q) for q in PathQuality}
+
+
+def test_mujoco_robot_fits_inside_the_planning_radius():
+    """Cross-component consistency: geometry vs the disc every planner assumes.
+
+    Maps, roadmap and collision all model the robot as a disc of ROBOT_RADIUS_M.
+    If the MuJoCo body is larger it cannot fit through gaps the planner considers
+    clear, and the symptom is a wall of collisions with no obvious cause -- the
+    earlier body had a 0.569 m envelope against a 0.350 m radius.
+    """
+    from pcnav.config import ROBOT_RADIUS_M
+    from pcnav.sim.mjcf import robot_footprint_radius
+
+    assert robot_footprint_radius() <= ROBOT_RADIUS_M, (
+        f"MuJoCo robot ({robot_footprint_radius():.3f} m) exceeds the planning "
+        f"radius ({ROBOT_RADIUS_M:.3f} m)"
+    )

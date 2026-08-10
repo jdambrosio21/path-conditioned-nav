@@ -35,6 +35,33 @@ from ..sim.mjcf import body_velocity_to_wheel_speeds, build_scene_xml
 # Beyond this body tilt the platform is considered to have rolled over.
 TIP_OVER_TILT_RAD = np.deg2rad(50.0)
 
+# Closed-loop gains for the low-level velocity controller.
+#
+# Open-loop skid-steer inverse kinematics does not work: rotating a rigid
+# four-wheel base requires scrubbing every wheel sideways against full friction,
+# and measured tracking was 0.08 rad/s achieved for 1.0 rad/s commanded -- an 8%
+# ratio that leaves the robot unable to turn a maze corner at all, and produced
+# 0.00 success in MuJoCo against 0.98 under idealized dynamics.
+#
+# The paper's low-level controller is a *trained locomotion policy* that closes
+# the loop on the velocity command. An open-loop map is not a controller, so this
+# is a modelling error rather than a physics finding. A PI controller on measured
+# body velocity is the honest minimal stand-in.
+# Gains from a sweep over (kp, ki, chassis mass); 6.0/4.0 overshot to 1.35 rad/s
+# on a 1.0 command while still stalling at 0.06 on a 0.5 command -- stiction plus
+# an over-aggressive loop. These track to ~0.1 combined error.
+# Disabled. The wheel actuators are already velocity servos, so an outer loop on
+# body velocity stacks two integrators and oscillates: with a zero command it
+# amplified settling noise into 4.7 rad/s of wheel drive and walked the robot into
+# walls. With the caster lift restoring wheel traction and the yaw feedforward
+# calibrated, open-loop inverse kinematics tracks to ~0.08 mean error, so the
+# outer loop has nothing left to correct.
+YAW_RATE_KP = 0.0
+YAW_RATE_KI = 0.0
+SPEED_KP = 0.0
+SPEED_KI = 0.0
+INTEGRAL_LIMIT = 8.0   # anti-windup clamp on the accumulated correction
+
 
 class MuJoCoNavEnv:
     """Thin sequential MuJoCo wrapper exposing the batched env's interface.
@@ -61,6 +88,12 @@ class MuJoCoNavEnv:
         self.models: list = [None] * self.num_envs
         self.datas: list = [None] * self.num_envs
         self._tipped = torch.zeros(self.num_envs, dtype=torch.bool)
+        self._speed_integral = np.zeros(self.num_envs)
+        self._yaw_integral = np.zeros(self.num_envs)
+        # Controller state, held separately from the measured body velocity. These
+        # are the rate-limited *setpoints* the low-level loop is chasing.
+        self._speed_setpoint = np.zeros(self.num_envs)
+        self._yaw_setpoint = np.zeros(self.num_envs)
 
         # Wire the delegate's dynamics and failure hooks to this backend.
         self.delegate._apply_action = self._apply_action_mujoco  # type: ignore[method-assign]
@@ -97,6 +130,10 @@ class MuJoCoNavEnv:
             self.datas[env_id] = data
             self.physics_substeps = int(round(1.0 / (NAV_POLICY_HZ * model.opt.timestep)))
             self._tipped[env_id] = False
+            self._speed_integral[env_id] = 0.0
+            self._yaw_integral[env_id] = 0.0
+            self._speed_setpoint[env_id] = 0.0
+            self._yaw_setpoint[env_id] = 0.0
 
     # ---------------------------------------------------------------- dynamics
 
@@ -110,25 +147,69 @@ class MuJoCoNavEnv:
         for env_id in range(self.num_envs):
             model, data = self.models[env_id], self.datas[env_id]
 
-            # Rate-limit the command exactly as the idealized backend does, so the
-            # two differ in physics rather than in the controller.
-            speed = float(self.delegate.forward_speed[env_id])
-            yaw_rate = float(self.delegate.yaw_rate[env_id])
+            # Rate-limit the setpoint exactly as the idealized backend does, so the
+            # two differ in physics rather than in the command they are given.
+            # The setpoint is controller state and must persist across steps. Seeding
+            # it from the measured body velocity -- which is what `delegate.
+            # forward_speed` holds after write-back -- closes a positive feedback
+            # loop: a physics disturbance raises the measurement, which raises the
+            # setpoint, which drives harder. With a zero action the robot drifted
+            # 0.37 m in four steps and eventually into a wall.
+            speed_setpoint = float(self._speed_setpoint[env_id])
+            yaw_setpoint = float(self._yaw_setpoint[env_id])
             target_speed = float(speed_cmd[env_id])
             target_yaw = float(yaw_cmd[env_id])
+            speed_integral = self._speed_integral[env_id]
+            yaw_integral = self._yaw_integral[env_id]
 
             for substep in range(self.physics_substeps):
                 if substep % control_decimation == 0:
-                    speed += np.clip(
-                        target_speed - speed, -MAX_LINEAR_ACCEL * dt, MAX_LINEAR_ACCEL * dt
+                    speed_setpoint += np.clip(
+                        target_speed - speed_setpoint,
+                        -MAX_LINEAR_ACCEL * dt,
+                        MAX_LINEAR_ACCEL * dt,
                     )
-                    yaw_rate += np.clip(
-                        target_yaw - yaw_rate, -MAX_ANGULAR_ACCEL * dt, MAX_ANGULAR_ACCEL * dt
+                    yaw_setpoint += np.clip(
+                        target_yaw - yaw_setpoint,
+                        -MAX_ANGULAR_ACCEL * dt,
+                        MAX_ANGULAR_ACCEL * dt,
                     )
-                    data.ctrl[:] = body_velocity_to_wheel_speeds(speed, yaw_rate)
+
+                    # Close the loop on measured body velocity.
+                    measured_speed, measured_yaw = self._measure_body_velocity(data)
+                    speed_error = speed_setpoint - measured_speed
+                    yaw_error = yaw_setpoint - measured_yaw
+                    speed_integral = float(
+                        np.clip(speed_integral + speed_error * dt, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
+                    )
+                    yaw_integral = float(
+                        np.clip(yaw_integral + yaw_error * dt, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
+                    )
+
+                    commanded_speed = (
+                        speed_setpoint + SPEED_KP * speed_error + SPEED_KI * speed_integral
+                    )
+                    commanded_yaw = (
+                        yaw_setpoint + YAW_RATE_KP * yaw_error + YAW_RATE_KI * yaw_integral
+                    )
+                    data.ctrl[:] = body_velocity_to_wheel_speeds(commanded_speed, commanded_yaw)
                 self.mujoco.mj_step(model, data)
 
+            self._speed_integral[env_id] = speed_integral
+            self._yaw_integral[env_id] = yaw_integral
+            self._speed_setpoint[env_id] = speed_setpoint
+            self._yaw_setpoint[env_id] = yaw_setpoint
             self._write_back_state(env_id)
+
+    @staticmethod
+    def _measure_body_velocity(data) -> tuple[float, float]:
+        """Forward speed and yaw rate of the chassis, in the body frame."""
+        quat = data.qpos[3:7]
+        w, x, y, z = quat
+        heading = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        world_vel = data.qvel[0:2]
+        forward = float(world_vel[0] * np.cos(heading) + world_vel[1] * np.sin(heading))
+        return forward, float(data.qvel[5])
 
     def _write_back_state(self, env_id: int) -> None:
         """Read the chassis pose/twist out of MuJoCo into the delegate's tensors."""

@@ -14,7 +14,7 @@ import time
 import numpy as np
 import torch
 
-from ..config import NAV_POLICY_HZ, PATH_VERTEX_SPACING_M
+from ..config import MAX_EPISODE_STEPS, NAV_POLICY_HZ, PATH_VERTEX_SPACING_M
 from ..envs.mujoco_env import MuJoCoNavEnv
 
 NUM_PATH_MARKERS = 60
@@ -54,7 +54,14 @@ class PolicyViewer:
 
         path = self.env.reference_path[env_id].numpy()
         path_len = int(self.env.reference_path_len[env_id])
-        stride = max(1, int(round(MARKER_STRIDE_M / PATH_VERTEX_SPACING_M)))
+
+        # Spread the fixed marker budget over the whole route rather than the first
+        # N vertices. Routes here run 60-100 m; a fixed 0.5 m stride would draw only
+        # the first 30 m and make a wrong-goal path look identical to a correct one.
+        if path_len > len(path_ids):
+            stride = max(1, path_len // len(path_ids))
+        else:
+            stride = max(1, int(round(MARKER_STRIDE_M / PATH_VERTEX_SPACING_M)))
 
         for slot, site_id in enumerate(path_ids):
             vertex = slot * stride
@@ -120,7 +127,7 @@ def render_episode_frames(
     env_id: int = 0,
     width: int = 960,
     height: int = 640,
-    max_steps: int = 300,
+    max_steps: int = MAX_EPISODE_STEPS,
     camera_distance: float = 14.0,
     camera_elevation: float = -55.0,
 ) -> tuple[list[np.ndarray], str]:
